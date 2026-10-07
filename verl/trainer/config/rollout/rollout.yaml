@@ -213,6 +213,13 @@ multi_turn:
   # max parallel call for tools in single turn
   max_parallel_calls: 1
 
+  # Optional fully-qualified request priority policy class. The policy receives
+  # backend-neutral per-turn context and may return a vLLM priority hint.
+  request_priority_policy: null
+
+  # Keyword arguments passed to request_priority_policy.
+  request_priority_policy_kwargs: {}
+
   # max length of tool response
   max_tool_response_length: 256
 

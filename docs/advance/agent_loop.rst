@@ -1,7 +1,7 @@
 Agent Loop
 ==========
 
-Last updated: 07/17/2025.
+Last updated: 10/07/2026.
 
 .. versionadded:: 0.4.2
    [status: alpha]
@@ -229,6 +229,62 @@ they can call ``LLMServerClient.generate`` to generate response_ids.
                List[int]: List of generated token ids.
            """
            ...
+
+Multi-turn request scheduling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ToolAgentLoop`` can attach backend-neutral scheduling metadata to every model
+request. The first request is classified as ``fresh``; requests after a tool
+call are ``continuation``; partial-rollout attempts are ``retry``. Scheduling is
+disabled by default, so existing rollout behavior is unchanged.
+
+The built-in effective-cost policy estimates request work as::
+
+   estimated_cost = (
+       prefill_weight * estimated_uncached_tokens
+       + decode_weight * expected_output_tokens
+         * (1 + prompt_tokens / decode_context_scale)
+   )
+   effective_cost = estimated_cost / (1 + wait_seconds / target_wait_seconds)
+
+Lower effective cost maps to higher vLLM scheduling priority. The waiting-time
+term provides soft aging so expensive requests eventually move forward. Backend
+priority currently requires vLLM and ``scheduling_policy: priority``.
+
+The admission router can also temporarily admit extra continuation and retry
+requests when they return from tool execution. The burst size is calculated
+from current fresh and resume pressure, capped by
+``max_resume_burst_requests``, and returns to zero when no resume request is
+present. It does not reserve idle capacity in advance.
+
+For example, add a router configuration file:
+
+.. code:: yaml
+
+   router_class: verl.workers.rollout.router.EffectiveCostAdmissionRequestLoadBalancer
+   max_concurrent_requests: 32
+   max_resume_burst_requests: 32
+   fresh_max_wait_seconds: 60
+   target_wait_seconds: 26
+
+Then configure rollout and the priority policy:
+
+.. code:: yaml
+
+   actor_rollout_ref:
+     rollout:
+       name: vllm
+       scheduling_policy: priority
+       router_config_path: /path/to/request_router.yaml
+       multi_turn:
+         request_priority_policy: verl.workers.rollout.request_scheduling.EffectiveCostPriorityPolicy
+         request_priority_policy_kwargs:
+           target_wait_seconds: 26
+           cost_per_priority: 256
+           max_priority: 64
+
+These values are illustrative. Tune the base capacity, burst cap, aging scale,
+and cost weights for the model, tool latency distribution, and rollout workload.
 
 Next
 ----

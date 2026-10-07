@@ -2,7 +2,7 @@
 
 **Authors**: Haichuan Hu, Yongxiang Huang, Jiawei Zhang, Nguyen Long
 
-Last updated: 06/16/2026.
+Last updated: 10/07/2026.
 
 ## Overview
 
@@ -123,7 +123,7 @@ For reward specifically:
 - **Hardware**: vLLM batch invariance (and some deterministic GPU ops) requires specific hardware — see the [vLLM batch invariance docs](https://docs.vllm.ai/en/latest/features/batch_invariance/) for requirements. On unsupported hardware, set `max_num_seqs=1` to serialize. `torch.use_deterministic_algorithms(True, warn_only=True)` warns when a deterministic kernel is unavailable.
 - **Backend**: only vLLM is supported.
 - **Trainer backend**: the V0 trainer (`trainer.use_v1=false`) is required. The default V1 backend's TransferQueue collects outputs in completion order, which is nondeterministic (see [Trainer backend](#trainer-backend-v0-required) above).
-- **Multi-turn agent**: not supported. Full determinism only works for single-turn rollouts (`single_turn_agent_loop`). Multi-turn rollouts (`tool_agent_loop`) are **not** bitwise reproducible — `tool_agent_loop` uses a random UUID per trajectory as `request_id`, does not pass `priority`, and each turn is interleaved with external tool calls whose timing varies across runs. Use `single_turn_agent_loop` for bitwise-reproducible rollouts.
+- **Multi-turn agent**: not supported. Full determinism only works for single-turn rollouts (`single_turn_agent_loop`). Multi-turn rollouts (`tool_agent_loop`) are **not** bitwise reproducible — `tool_agent_loop` uses a random UUID per trajectory, and each turn is interleaved with external tool calls whose timing varies across runs. Optional request-priority policies change scheduling order but do not make multi-turn execution deterministic. Use `single_turn_agent_loop` for bitwise-reproducible rollouts.
 
 ## Verifying Determinism
 
