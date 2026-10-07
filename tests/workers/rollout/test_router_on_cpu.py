@@ -18,6 +18,7 @@ import logging
 import os
 import time
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -26,6 +27,7 @@ from omegaconf import OmegaConf
 
 from verl.utils.import_utils import resolve_config_path
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
+from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.router import (
     EffectiveCostAdmissionRequestLoadBalancer,
     GlobalRequestLoadBalancer,
@@ -272,6 +274,108 @@ class TestRequireFields:
         assert client._request_priority(fresh_context) == 11
         assert client._request_priority(_request_context("continuation")) == -2
         assert client._request_priority(_request_context("retry")) == -5
+
+    @pytest.mark.parametrize(
+        ("rollout_name", "sglang_kwargs", "priority", "expected"),
+        [
+            ("vllm", {}, 7, 7),
+            ("sglang", {"enable_priority_scheduling": True}, 7, -7),
+            (
+                "sglang",
+                {
+                    "enable_priority_scheduling": True,
+                    "schedule_low_priority_values_first": True,
+                },
+                7,
+                7,
+            ),
+        ],
+    )
+    def test_client_translates_backend_priority_direction(self, rollout_name, sglang_kwargs, priority, expected):
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "rollout": {
+                        "name": rollout_name,
+                        "engine_kwargs": {"sglang": sglang_kwargs},
+                    }
+                }
+            }
+        )
+        client = LLMServerClient(config=config, load_balancer_handle=None)
+
+        assert client._backend_priority(priority) == expected
+
+    def test_sglang_priority_policy_requires_backend_scheduling(self):
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "rollout": {
+                        "name": "sglang",
+                        "engine_kwargs": {"sglang": {}},
+                        "multi_turn": {
+                            "request_priority_policy": (
+                                "verl.workers.rollout.request_scheduling.RequestKindPriorityPolicy"
+                            ),
+                            "request_priority_policy_kwargs": {"priority_offsets": {"continuation": -1}},
+                        },
+                    }
+                }
+            }
+        )
+
+        with pytest.raises(ValueError, match="enable_priority_scheduling"):
+            LLMServerClient(config=config, load_balancer_handle=None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("priority_enabled", "low_values_first", "expected_priority"),
+        [
+            (False, False, None),
+            (True, False, -7),
+            (True, True, 7),
+        ],
+    )
+    async def test_client_forwards_sglang_priority(
+        self,
+        priority_enabled,
+        low_values_first,
+        expected_priority,
+    ):
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "rollout": {
+                        "name": "sglang",
+                        "full_determinism": False,
+                        "engine_kwargs": {
+                            "sglang": {
+                                "enable_priority_scheduling": priority_enabled,
+                                "schedule_low_priority_values_first": low_values_first,
+                            }
+                        },
+                    }
+                }
+            }
+        )
+        client = LLMServerClient(config=config, load_balancer_handle=None)
+        server = MagicMock()
+        server.generate.remote = AsyncMock(return_value=TokenOutput(token_ids=[1], log_probs=None))
+        client._acquire_server = AsyncMock(return_value=("s0", server))
+        client._release_server = MagicMock()
+
+        await client.generate(
+            request_id="request-0",
+            prompt_ids=[1, 2],
+            sampling_params={"max_tokens": 1},
+            priority=7,
+        )
+
+        call_kwargs = server.generate.remote.await_args.kwargs
+        if expected_priority is None:
+            assert "priority" not in call_kwargs
+        else:
+            assert call_kwargs["priority"] == expected_priority
 
     def test_client_acquire_serializes_only_declared_fields(self, ray_session, tmp_path):
         """Declarations are queried lazily exactly once (verified via the mock's

@@ -247,9 +247,12 @@ The built-in effective-cost policy estimates request work as::
    )
    effective_cost = estimated_cost / (1 + wait_seconds / target_wait_seconds)
 
-Lower effective cost maps to higher vLLM scheduling priority. The waiting-time
-term provides soft aging so expensive requests eventually move forward. Backend
-priority currently requires vLLM and ``scheduling_policy: priority``.
+Lower effective cost maps to higher backend scheduling priority. The
+waiting-time term provides soft aging so expensive requests eventually move
+forward. vLLM requires ``scheduling_policy: priority``. SGLang requires
+``enable_priority_scheduling: true`` and uses ``fcfs`` or ``lof`` as its base
+schedule policy. verl translates the priority direction when SGLang keeps its
+default higher-value-first behavior.
 
 The admission router can also temporarily admit extra continuation and retry
 requests when they return from tool execution. The burst size is calculated
@@ -285,6 +288,22 @@ Then configure rollout and the priority policy:
 
 These values are illustrative. Tune the base capacity, burst cap, aging scale,
 and cost weights for the model, tool latency distribution, and rollout workload.
+
+For SGLang, replace the vLLM-specific fields with:
+
+.. code:: yaml
+
+   actor_rollout_ref:
+     rollout:
+       name: sglang
+       engine_kwargs:
+         sglang:
+           enable_priority_scheduling: true
+           schedule_policy: fcfs
+
+``schedule_low_priority_values_first: true`` is also supported. When it is
+unset, verl negates its lower-value-first priority before sending the request so
+the ordering remains consistent across vLLM and SGLang.
 
 Next
 ----

@@ -518,6 +518,7 @@ class SGLangHttpServer:
         request_id: str,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        priority: Optional[int] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
@@ -535,6 +536,7 @@ class SGLangHttpServer:
                 f"{request_id}_P",
                 image_data=image_data,
                 video_data=video_data,
+                priority=priority,
                 bootstrap_host=self._pd_bootstrap_host,
                 bootstrap_port=self._disaggregation_bootstrap_port,
                 bootstrap_room=room,
@@ -545,6 +547,7 @@ class SGLangHttpServer:
                 f"{request_id}_D",
                 image_data=image_data,
                 video_data=video_data,
+                priority=priority,
                 bootstrap_host=self._pd_bootstrap_host,
                 bootstrap_port=self._disaggregation_bootstrap_port,
                 bootstrap_room=room,
@@ -599,6 +602,7 @@ class SGLangHttpServer:
             # the agent loop, not raw frames: SGLang's video_data only accepts a path/url/base64
             # or a dict. Dropping it silently makes the model answer video questions blind.
             "video_data": video_data,
+            "priority": priority,
         }
 
         if prompt_logprobs is not None:
