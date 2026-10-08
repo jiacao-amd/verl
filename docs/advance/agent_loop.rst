@@ -256,8 +256,8 @@ For example, one tested vLLM configuration uses:
 
    router_class: verl.workers.rollout.router.SoftAdmissionRequestLoadBalancer
    max_concurrent_requests: 40
-   fresh_wave_max_resume_burst_requests: 8
-   max_resume_burst_requests: 24
+   fresh_wave_max_resume_burst_requests: 1
+   max_resume_burst_requests: 20
    fresh_max_wait_seconds: 60
 
 Then configure rollout without a request priority policy:
@@ -268,12 +268,16 @@ Then configure rollout without a request priority policy:
      rollout:
        name: vllm
        scheduling_policy: fcfs
-       max_num_seqs: 28
+       max_num_seqs: 32
+       engine_kwargs:
+         vllm:
+           max_num_batched_tokens: 32768
        router_config_path: /path/to/request_router.yaml
 
 These values are workload-specific starting points. Tune the backend
-running-request limit, base capacity, fresh-wave burst cap, and post-fresh burst
-cap jointly for the model, tool latency distribution, and rollout batch size.
+running-request limit, per-iteration token budget, base capacity, fresh-wave
+burst cap, and post-fresh burst cap jointly for the model, prompt length, tool
+latency distribution, and rollout batch size.
 
 Strict continuation priority is intended for latency-sensitive experiments, not
 as the default wall-time optimization. It can reduce continuation TTFT while
