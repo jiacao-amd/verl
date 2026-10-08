@@ -326,8 +326,10 @@ class SoftAdmissionRequestLoadBalancer(GlobalRequestLoadBalancer):
 
     The base capacity remains available to every request. When resumed requests
     are queued, the router can temporarily admit additional continuations and
-    retries. Fresh requests may use base-capacity slots released by those
-    requests, while an optional wait bound prevents starvation.
+    retries. An optional lower burst cap applies while fresh requests remain
+    queued, then expands after the fresh queue drains. Fresh requests may use
+    base-capacity slots released by resumed requests, while an optional wait
+    bound prevents starvation.
 
     This class is selected through ``rollout.router_config_path`` and receives
     the router YAML as ``router_kwargs``. It is disabled unless explicitly
@@ -352,6 +354,19 @@ class SoftAdmissionRequestLoadBalancer(GlobalRequestLoadBalancer):
         if not isinstance(max_resume_burst, int) or isinstance(max_resume_burst, bool) or max_resume_burst < 0:
             raise ValueError("max_resume_burst_requests must be a non-negative integer")
 
+        fresh_wave_max_resume_burst = router_kwargs.get(
+            "fresh_wave_max_resume_burst_requests",
+            max_resume_burst,
+        )
+        if (
+            not isinstance(fresh_wave_max_resume_burst, int)
+            or isinstance(fresh_wave_max_resume_burst, bool)
+            or fresh_wave_max_resume_burst < 0
+        ):
+            raise ValueError("fresh_wave_max_resume_burst_requests must be a non-negative integer")
+        if fresh_wave_max_resume_burst > max_resume_burst:
+            raise ValueError("fresh_wave_max_resume_burst_requests must not exceed max_resume_burst_requests")
+
         super().__init__(
             servers=servers,
             max_cache_size=router_kwargs.get("max_cache_size", DEFAULT_ROUTING_CACHE_SIZE),
@@ -360,6 +375,7 @@ class SoftAdmissionRequestLoadBalancer(GlobalRequestLoadBalancer):
         self._capacity = capacity
         self._fresh_max_wait = fresh_max_wait
         self._max_resume_burst = max_resume_burst
+        self._fresh_wave_max_resume_burst = fresh_wave_max_resume_burst
         self._fresh_waiters: deque[_AdmissionWaiter] = deque()
         self._resume_waiters: deque[_AdmissionWaiter] = deque()
         self._inflight_by_kind = dict.fromkeys(self._REQUEST_KINDS, 0)
@@ -481,14 +497,15 @@ class SoftAdmissionRequestLoadBalancer(GlobalRequestLoadBalancer):
         return self._resume_waiters.popleft()
 
     def _resume_burst_target(self) -> int:
-        if self._max_resume_burst == 0:
+        burst_cap = self._fresh_wave_max_resume_burst if self._fresh_waiters else self._max_resume_burst
+        if burst_cap == 0:
             return 0
         resume_pressure = sum(self._inflight_by_kind[kind] for kind in self._RESUME_KINDS) + len(self._resume_waiters)
         if resume_pressure == 0:
             return 0
         fresh_pressure = self._inflight_by_kind["fresh"] + len(self._fresh_waiters)
         target = math.ceil(self._capacity * resume_pressure / (resume_pressure + fresh_pressure))
-        target = min(self._max_resume_burst, target)
+        target = min(burst_cap, target)
         self._max_resume_burst_target = max(self._max_resume_burst_target, target)
         return target
 
@@ -543,6 +560,7 @@ class SoftAdmissionRequestLoadBalancer(GlobalRequestLoadBalancer):
         status["admission"] = {
             "capacity": self._capacity,
             "max_resume_burst_requests": self._max_resume_burst,
+            "fresh_wave_max_resume_burst_requests": self._fresh_wave_max_resume_burst,
             "resume_burst_target": self._resume_burst_target(),
             "max_resume_burst_target": self._max_resume_burst_target,
             "burst_admissions": self._burst_admissions,

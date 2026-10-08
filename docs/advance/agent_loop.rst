@@ -238,7 +238,49 @@ request. The first request is classified as ``fresh``; requests after a tool
 call are ``continuation``; partial-rollout attempts are ``retry``. Scheduling is
 disabled by default, so existing rollout behavior is unchanged.
 
-The built-in effective-cost policy estimates request work as::
+For throughput-oriented vLLM rollouts, prefer FIFO backend scheduling with a
+resume-only admission burst. The base admission capacity remains available to
+all requests, while continuation and retry requests may temporarily use extra
+slots after returning from tool execution. The burst size is calculated from
+current fresh and resume pressure, capped by
+``max_resume_burst_requests``, and returns to zero when no resume request is
+present. It does not reserve idle capacity in advance or let resumed requests
+strictly overtake fresh requests in the backend scheduler. An optional
+``fresh_wave_max_resume_burst_requests`` cap can keep that burst smaller while
+fresh requests remain queued, then allow it to expand after the fresh queue
+drains.
+
+For example, one tested vLLM configuration uses:
+
+.. code:: yaml
+
+   router_class: verl.workers.rollout.router.SoftAdmissionRequestLoadBalancer
+   max_concurrent_requests: 40
+   fresh_wave_max_resume_burst_requests: 8
+   max_resume_burst_requests: 24
+   fresh_max_wait_seconds: 60
+
+Then configure rollout without a request priority policy:
+
+.. code:: yaml
+
+   actor_rollout_ref:
+     rollout:
+       name: vllm
+       scheduling_policy: fcfs
+       max_num_seqs: 28
+       router_config_path: /path/to/request_router.yaml
+
+These values are workload-specific starting points. Tune the backend
+running-request limit, base capacity, fresh-wave burst cap, and post-fresh burst
+cap jointly for the model, tool latency distribution, and rollout batch size.
+
+Strict continuation priority is intended for latency-sensitive experiments, not
+as the default wall-time optimization. It can reduce continuation TTFT while
+delaying fresh requests that would otherwise unlock later tool and model turns.
+To experiment with it, configure
+``EffectiveCostAdmissionRequestLoadBalancer`` and
+``EffectiveCostPriorityPolicy``. The policy estimates request work as::
 
    estimated_cost = (
        prefill_weight * estimated_uncached_tokens
@@ -247,49 +289,11 @@ The built-in effective-cost policy estimates request work as::
    )
    effective_cost = estimated_cost / (1 + wait_seconds / target_wait_seconds)
 
-Lower effective cost maps to higher backend scheduling priority. The
-waiting-time term provides soft aging so expensive requests eventually move
-forward. vLLM requires ``scheduling_policy: priority``. SGLang requires
+Lower effective cost maps to higher backend scheduling priority. vLLM requires
+``scheduling_policy: priority``. SGLang requires
 ``enable_priority_scheduling: true`` and uses ``fcfs`` or ``lof`` as its base
 schedule policy. verl translates the priority direction when SGLang keeps its
-default higher-value-first behavior.
-
-The admission router can also temporarily admit extra continuation and retry
-requests when they return from tool execution. The burst size is calculated
-from current fresh and resume pressure, capped by
-``max_resume_burst_requests``, and returns to zero when no resume request is
-present. It does not reserve idle capacity in advance.
-
-For example, add a router configuration file:
-
-.. code:: yaml
-
-   router_class: verl.workers.rollout.router.EffectiveCostAdmissionRequestLoadBalancer
-   max_concurrent_requests: 32
-   max_resume_burst_requests: 32
-   fresh_max_wait_seconds: 60
-   target_wait_seconds: 26
-
-Then configure rollout and the priority policy:
-
-.. code:: yaml
-
-   actor_rollout_ref:
-     rollout:
-       name: vllm
-       scheduling_policy: priority
-       router_config_path: /path/to/request_router.yaml
-       multi_turn:
-         request_priority_policy: verl.workers.rollout.request_scheduling.EffectiveCostPriorityPolicy
-         request_priority_policy_kwargs:
-           target_wait_seconds: 26
-           cost_per_priority: 256
-           max_priority: 64
-
-These values are illustrative. Tune the base capacity, burst cap, aging scale,
-and cost weights for the model, tool latency distribution, and rollout workload.
-
-For SGLang, replace the vLLM-specific fields with:
+default higher-value-first behavior. For SGLang, configure:
 
 .. code:: yaml
 

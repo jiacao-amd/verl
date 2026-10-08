@@ -214,7 +214,9 @@ multi_turn:
   max_parallel_calls: 1
 
   # Optional fully-qualified request priority policy class. The policy receives
-  # backend-neutral per-turn context and may return a vLLM priority hint.
+  # backend-neutral per-turn context and may return a backend priority hint.
+  # Leave this null when optimizing full-rollout wall time with resume-only
+  # admission burst; strict continuation priority can delay fresh trajectories.
   request_priority_policy: null
 
   # Keyword arguments passed to request_priority_policy.

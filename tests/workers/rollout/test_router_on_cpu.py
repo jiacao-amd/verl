@@ -595,6 +595,21 @@ class TestSoftAdmissionRequestLoadBalancer:
                 },
                 "max_resume_burst_requests",
             ),
+            (
+                {
+                    "max_concurrent_requests": 2,
+                    "fresh_wave_max_resume_burst_requests": -1,
+                },
+                "fresh_wave_max_resume_burst_requests",
+            ),
+            (
+                {
+                    "max_concurrent_requests": 2,
+                    "max_resume_burst_requests": 1,
+                    "fresh_wave_max_resume_burst_requests": 2,
+                },
+                "fresh_wave_max_resume_burst_requests",
+            ),
         ],
     )
     def test_invalid_config_rejected(self, router_kwargs, message):
@@ -621,6 +636,7 @@ class TestSoftAdmissionRequestLoadBalancer:
         assert burst_resume.done()
         assert not queued_fresh.done()
         status = lb.get_status()["admission"]
+        assert status["fresh_wave_max_resume_burst_requests"] == 2
         assert status["max_admitted_requests"] == 3
         assert status["burst_admissions"] == 1
 
@@ -634,6 +650,50 @@ class TestSoftAdmissionRequestLoadBalancer:
         await lb.release_server("s0", request_id="fresh-1", request_kind="fresh")
         await lb.release_server("s0", request_id="fresh-2", request_kind="fresh")
         await lb.release_server("s0", request_id="resume-0", request_kind="continuation")
+
+    @pytest.mark.asyncio
+    async def test_resume_burst_expands_after_fresh_wave_is_admitted(self):
+        lb = SoftAdmissionRequestLoadBalancer(
+            servers={"s0": None},
+            router_kwargs={
+                "max_concurrent_requests": 2,
+                "max_resume_burst_requests": 2,
+                "fresh_wave_max_resume_burst_requests": 1,
+            },
+        )
+
+        await lb.acquire_server("fresh-0", _request_context("fresh"))
+        await lb.acquire_server("fresh-1", _request_context("fresh"))
+        queued_fresh = asyncio.create_task(lb.acquire_server("fresh-2", _request_context("fresh")))
+        burst_resume = asyncio.create_task(lb.acquire_server("resume-0", _request_context("continuation")))
+        await asyncio.sleep(0)
+        assert burst_resume.done()
+
+        queued_resume_1 = asyncio.create_task(lb.acquire_server("resume-1", _request_context("continuation")))
+        queued_resume_2 = asyncio.create_task(lb.acquire_server("resume-2", _request_context("continuation")))
+        await asyncio.sleep(0)
+        assert not queued_resume_1.done()
+        assert not queued_resume_2.done()
+        status = lb.get_status()["admission"]
+        assert status["fresh_wave_max_resume_burst_requests"] == 1
+        assert status["resume_burst_target"] == 1
+
+        await lb.release_server("s0", request_id="fresh-0", request_kind="fresh")
+        await asyncio.sleep(0)
+        assert queued_fresh.done()
+        assert queued_resume_1.done()
+        assert not queued_resume_2.done()
+        status = lb.get_status()["admission"]
+        assert status["resume_burst_target"] == 2
+        assert status["max_admitted_requests"] == 4
+
+        await lb.release_server("s0", request_id="fresh-1", request_kind="fresh")
+        await lb.release_server("s0", request_id="fresh-2", request_kind="fresh")
+        await lb.release_server("s0", request_id="resume-0", request_kind="continuation")
+        await asyncio.sleep(0)
+        assert queued_resume_2.done()
+        await lb.release_server("s0", request_id="resume-1", request_kind="continuation")
+        await lb.release_server("s0", request_id="resume-2", request_kind="continuation")
 
     @pytest.mark.asyncio
     async def test_dynamic_resume_burst_respects_reduced_target(self):
