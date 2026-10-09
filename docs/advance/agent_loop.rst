@@ -456,6 +456,24 @@ for burst versus 12.179957, 12.193477, and 12.191508 seconds for FIFO. The burst
 group is rejected in full because its CV is 2.20%; it supplies no stable gain
 or production recommendation. Retain FIFO for single TP8.
 
+Backend request-kind priority needs overlapping fresh and continuation requests
+in the waiting queue to change their relative admission order. In all three
+formal TP8 repetitions above, all 64 fresh requests finish before the first
+continuation is submitted: the fresh wave ends at 6.194-6.223 seconds, and the
+first continuation arrives at 6.308-6.337 seconds. The same holds for the two
+TP4 replicas, with the fresh wave ending at 4.311-4.371 seconds and continuation
+submission starting at 4.489-4.538 seconds. The single-TP4 capacity-40 reference
+has more overlap: only five fresh requests have completed when the first
+continuation is submitted. Request-kind priority therefore has different
+opportunities in these configurations, even with the same pipelined workload.
+
+In this vLLM build, ``priority`` orders waiting requests by lower integer
+priority, then earlier arrival time. Running requests are scheduled before
+waiting requests and are not sorted by priority each step. Priority also
+determines the preemption victim when KV allocation fails. Changing backend
+priority does not directly reduce the compute cost of running requests; measure
+full rollout wall time and verify queue overlap before attributing a gain to it.
+
 ``--enable-expert-parallel`` was measured separately after a limited correctness
 smoke evaluation. Base TP8 and EP both scored 24/24 on fixed-answer questions,
 but five of eight deterministic free-generation prompts differed, including a
@@ -482,7 +500,10 @@ To experiment with it, configure
    effective_cost = estimated_cost / (1 + wait_seconds / target_wait_seconds)
 
 Lower effective cost maps to higher backend scheduling priority. vLLM requires
-``scheduling_policy: priority``. SGLang requires
+``scheduling_policy: priority``. The policy computes aging once, after router
+admission and before backend submission. It does not update a request's priority
+while that request waits inside vLLM, so ``max_wait_seconds`` is not a backend
+queue waiting-time bound. SGLang requires
 ``enable_priority_scheduling: true`` and uses ``fcfs`` or ``lof`` as its base
 schedule policy. verl translates the priority direction when SGLang keeps its
 default higher-value-first behavior. For SGLang, configure:
