@@ -187,11 +187,9 @@ async def test_partial_rollout_attempts_update_request_context(server):
         "request_kind": "continuation",
         "turn_index": 2,
         "attempt_index": 0,
-        "base_priority": 0,
         "prompt_tokens": 136,
         "estimated_uncached_tokens": 12,
         "enqueued_at": 1.0,
-        "policy_version": 7,
     }
 
     await _generate(

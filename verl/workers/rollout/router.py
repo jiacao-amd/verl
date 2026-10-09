@@ -27,11 +27,6 @@ from cachetools import LRUCache
 from omegaconf import OmegaConf
 
 from verl.utils.import_utils import load_class_from_fqn, resolve_config_path
-from verl.workers.rollout.request_scheduling import (
-    LinearRequestCostEstimator,
-    RolloutRequestContext,
-    effective_request_cost,
-)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -317,7 +312,6 @@ class _AdmissionWaiter:
     request_kind: str
     enqueued_at: float
     future: asyncio.Future[tuple[str, Any]]
-    request_context: dict[str, Any] | None = None
     admitted_server_id: str | None = None
 
 
@@ -421,7 +415,6 @@ class SoftAdmissionRequestLoadBalancer(GlobalRequestLoadBalancer):
             request_kind=request_kind,
             enqueued_at=self._clock(),
             future=future,
-            request_context=request_context,
         )
         queue = self._resume_waiters if request_kind in self._RESUME_KINDS else self._fresh_waiters
         queue.append(waiter)
@@ -584,86 +577,6 @@ class SoftAdmissionRequestLoadBalancer(GlobalRequestLoadBalancer):
                 max(0.0, now - self._fresh_waiters[0].enqueued_at) if self._fresh_waiters else 0.0
             ),
         }
-        return status
-
-
-class EffectiveCostAdmissionRequestLoadBalancer(SoftAdmissionRequestLoadBalancer):
-    """Order fresh and resumed requests by cost with soft aging.
-
-    This strategy uses the same effective-cost formula as the backend priority
-    policy. It remains work-conserving and retains the optional hard fresh wait
-    limit from :class:`SoftAdmissionRequestLoadBalancer`.
-    """
-
-    def __init__(self, servers: dict[str, Any], router_kwargs: dict[str, Any]):
-        target_wait_seconds = router_kwargs.get("target_wait_seconds")
-        if (
-            not isinstance(target_wait_seconds, int | float)
-            or isinstance(target_wait_seconds, bool)
-            or target_wait_seconds <= 0
-        ):
-            raise ValueError("target_wait_seconds must be positive")
-        cost_estimator_kwargs = router_kwargs.get("cost_estimator_kwargs", {})
-        if not isinstance(cost_estimator_kwargs, dict):
-            raise ValueError("cost_estimator_kwargs must be a mapping")
-
-        super().__init__(servers=servers, router_kwargs=router_kwargs)
-        self._target_wait_seconds = float(target_wait_seconds)
-        self._cost_estimator = LinearRequestCostEstimator(**cost_estimator_kwargs)
-
-    def _waiter_effective_cost(self, waiter: _AdmissionWaiter, now: float) -> float:
-        if waiter.request_context is None:
-            return self._cost_estimator.minimum_cost
-        context = RolloutRequestContext.from_dict(waiter.request_context)
-        return effective_request_cost(
-            context,
-            wait_seconds=max(0.0, now - waiter.enqueued_at),
-            target_wait_seconds=self._target_wait_seconds,
-            cost_estimator=self._cost_estimator,
-        )
-
-    def _select_waiter(self) -> _AdmissionWaiter | None:
-        self._drop_cancelled_waiters()
-        if not self._fresh_waiters:
-            return self._resume_waiters.popleft() if self._resume_waiters else None
-
-        now = self._clock()
-        oldest_fresh = self._fresh_waiters[0]
-        fresh_wait_seconds = max(0.0, now - oldest_fresh.enqueued_at)
-        if self._fresh_max_wait is not None and fresh_wait_seconds >= self._fresh_max_wait:
-            return self._fresh_waiters.popleft()
-
-        if not self._resume_waiters:
-            return self._fresh_waiters.popleft()
-
-        oldest_resume = self._resume_waiters[0]
-        fresh_cost = self._waiter_effective_cost(oldest_fresh, now)
-        resume_cost = self._waiter_effective_cost(oldest_resume, now)
-        if fresh_cost == resume_cost:
-            if oldest_fresh.enqueued_at <= oldest_resume.enqueued_at:
-                return self._fresh_waiters.popleft()
-            return self._resume_waiters.popleft()
-        if fresh_cost < resume_cost:
-            return self._fresh_waiters.popleft()
-        return self._resume_waiters.popleft()
-
-    def get_status(self) -> dict:
-        status = super().get_status()
-        now = self._clock()
-        status["admission"].update(
-            {
-                "strategy": "effective_cost",
-                "target_wait_seconds": self._target_wait_seconds,
-                "head_effective_cost": {
-                    "fresh": (
-                        self._waiter_effective_cost(self._fresh_waiters[0], now) if self._fresh_waiters else None
-                    ),
-                    "resume": (
-                        self._waiter_effective_cost(self._resume_waiters[0], now) if self._resume_waiters else None
-                    ),
-                },
-            }
-        )
         return status
 
 

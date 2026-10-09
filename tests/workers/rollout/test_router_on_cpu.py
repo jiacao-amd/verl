@@ -29,7 +29,6 @@ from verl.utils.import_utils import resolve_config_path
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.router import (
-    EffectiveCostAdmissionRequestLoadBalancer,
     GlobalRequestLoadBalancer,
     SoftAdmissionRequestLoadBalancer,
     get_router_handle,
@@ -246,136 +245,38 @@ class TestRequireFields:
         assert lb.require_acquire_fields() == ["request_context"]
         assert lb.require_release_fields() == ["request_kind"]
 
-    def test_client_priority_policy_is_evaluated_per_request_kind(self):
-        config = OmegaConf.create(
-            {
-                "actor_rollout_ref": {
-                    "rollout": {
-                        "multi_turn": {
-                            "request_priority_policy": (
-                                "verl.workers.rollout.request_scheduling.RequestKindPriorityPolicy"
-                            ),
-                            "request_priority_policy_kwargs": {
-                                "priority_offsets": {
-                                    "fresh": 4,
-                                    "continuation": -2,
-                                    "retry": -5,
-                                }
-                            },
-                        }
-                    }
-                }
-            }
-        )
-        client = LLMServerClient(config=config, load_balancer_handle=None)
-
-        fresh_context = _request_context("fresh")
-        fresh_context["base_priority"] = 7
-        assert client._request_priority(fresh_context) == 11
-        assert client._request_priority(_request_context("continuation")) == -2
-        assert client._request_priority(_request_context("retry")) == -5
-
-    @pytest.mark.parametrize(
-        ("rollout_name", "sglang_kwargs", "priority", "expected"),
-        [
-            ("vllm", {}, 7, 7),
-            ("sglang", {"enable_priority_scheduling": True}, 7, -7),
-            (
-                "sglang",
-                {
-                    "enable_priority_scheduling": True,
-                    "schedule_low_priority_values_first": True,
-                },
-                7,
-                7,
-            ),
-        ],
-    )
-    def test_client_translates_backend_priority_direction(self, rollout_name, sglang_kwargs, priority, expected):
-        config = OmegaConf.create(
-            {
-                "actor_rollout_ref": {
-                    "rollout": {
-                        "name": rollout_name,
-                        "engine_kwargs": {"sglang": sglang_kwargs},
-                    }
-                }
-            }
-        )
-        client = LLMServerClient(config=config, load_balancer_handle=None)
-
-        assert client._backend_priority(priority) == expected
-
-    def test_sglang_priority_policy_requires_backend_scheduling(self):
-        config = OmegaConf.create(
-            {
-                "actor_rollout_ref": {
-                    "rollout": {
-                        "name": "sglang",
-                        "engine_kwargs": {"sglang": {}},
-                        "multi_turn": {
-                            "request_priority_policy": (
-                                "verl.workers.rollout.request_scheduling.RequestKindPriorityPolicy"
-                            ),
-                            "request_priority_policy_kwargs": {"priority_offsets": {"continuation": -1}},
-                        },
-                    }
-                }
-            }
-        )
-
-        with pytest.raises(ValueError, match="enable_priority_scheduling"):
-            LLMServerClient(config=config, load_balancer_handle=None)
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("priority_enabled", "low_values_first", "expected_priority"),
-        [
-            (False, False, None),
-            (True, False, -7),
-            (True, True, 7),
-        ],
+        ("rollout_name", "priority", "expected_priority"),
+        [("vllm", 0, None), ("vllm", 7, 7), ("sglang", 0, None), ("sglang", 7, None)],
     )
-    async def test_client_forwards_sglang_priority(
-        self,
-        priority_enabled,
-        low_values_first,
-        expected_priority,
+    async def test_admission_context_stays_in_router_and_legacy_priority_is_preserved(
+        self, rollout_name, priority, expected_priority
     ):
-        config = OmegaConf.create(
-            {
-                "actor_rollout_ref": {
-                    "rollout": {
-                        "name": "sglang",
-                        "full_determinism": False,
-                        "engine_kwargs": {
-                            "sglang": {
-                                "enable_priority_scheduling": priority_enabled,
-                                "schedule_low_priority_values_first": low_values_first,
-                            }
-                        },
-                    }
-                }
-            }
-        )
+        config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"name": rollout_name, "full_determinism": False}}})
         client = LLMServerClient(config=config, load_balancer_handle=None)
         server = MagicMock()
         server.generate.remote = AsyncMock(return_value=TokenOutput(token_ids=[1], log_probs=None))
         client._acquire_server = AsyncMock(return_value=("s0", server))
         client._release_server = MagicMock()
+        context = _request_context("continuation")
 
         await client.generate(
             request_id="request-0",
             prompt_ids=[1, 2],
             sampling_params={"max_tokens": 1},
-            priority=7,
+            request_context=context,
+            priority=priority,
         )
 
-        call_kwargs = server.generate.remote.await_args.kwargs
+        assert client._acquire_server.await_args.kwargs["request_context"] == context
+        backend_kwargs = server.generate.remote.await_args.kwargs
+        assert "request_context" not in backend_kwargs
         if expected_priority is None:
-            assert "priority" not in call_kwargs
+            assert "priority" not in backend_kwargs
         else:
-            assert call_kwargs["priority"] == expected_priority
+            assert backend_kwargs["priority"] == expected_priority
+        client._release_server.assert_called_once_with("s0", request_id="request-0", request_kind="continuation")
 
     def test_client_acquire_serializes_only_declared_fields(self, ray_session, tmp_path):
         """Declarations are queried lazily exactly once (verified via the mock's
@@ -508,11 +409,9 @@ def _request_context(
         "request_kind": request_kind,
         "turn_index": 0,
         "attempt_index": 0,
-        "base_priority": 0,
         "prompt_tokens": prompt_tokens,
         "estimated_uncached_tokens": estimated_uncached_tokens,
         "enqueued_at": 0.0,
-        "policy_version": None,
         "expected_output_tokens": expected_output_tokens,
     }
 
@@ -721,92 +620,6 @@ class TestSoftAdmissionRequestLoadBalancer:
         await lb.release_server("s0", request_id="resume-1", request_kind="continuation")
         await lb.release_server("s0", request_id="fresh-0", request_kind="fresh")
         await lb.release_server("s0", request_id="fresh-1", request_kind="fresh")
-
-
-class TestEffectiveCostAdmissionRequestLoadBalancer:
-    @pytest.mark.asyncio
-    async def test_lower_effective_cost_is_admitted_first(self):
-        lb = EffectiveCostAdmissionRequestLoadBalancer(
-            servers={"s0": None},
-            router_kwargs={
-                "max_concurrent_requests": 1,
-                "target_wait_seconds": 1,
-            },
-        )
-
-        await lb.acquire_server("blocker", _request_context("fresh"))
-        expensive_fresh = asyncio.create_task(
-            lb.acquire_server(
-                "fresh",
-                _request_context("fresh", prompt_tokens=8192, estimated_uncached_tokens=8192),
-            )
-        )
-        cheap_resume = asyncio.create_task(
-            lb.acquire_server(
-                "resume",
-                _request_context("continuation", prompt_tokens=8192, estimated_uncached_tokens=32),
-            )
-        )
-        await asyncio.sleep(0)
-
-        await lb.release_server("s0", request_kind="fresh")
-        await asyncio.sleep(0)
-        assert cheap_resume.done()
-        assert not expensive_fresh.done()
-
-        await lb.release_server("s0", request_kind="continuation")
-        await asyncio.sleep(0)
-        assert expensive_fresh.done()
-        await lb.release_server("s0", request_kind="fresh")
-
-    @pytest.mark.asyncio
-    async def test_waiting_reduces_effective_cost(self):
-        lb = EffectiveCostAdmissionRequestLoadBalancer(
-            servers={"s0": None},
-            router_kwargs={
-                "max_concurrent_requests": 1,
-                "target_wait_seconds": 1,
-            },
-        )
-        now = [0.0]
-        lb._clock = lambda: now[0]
-
-        await lb.acquire_server("blocker", _request_context("fresh"))
-        old_fresh = asyncio.create_task(
-            lb.acquire_server(
-                "fresh",
-                _request_context("fresh", prompt_tokens=100, estimated_uncached_tokens=100),
-            )
-        )
-        await asyncio.sleep(0)
-        now[0] = 10.0
-        new_resume = asyncio.create_task(
-            lb.acquire_server(
-                "resume",
-                _request_context("continuation", prompt_tokens=10, estimated_uncached_tokens=10),
-            )
-        )
-        await asyncio.sleep(0)
-
-        await lb.release_server("s0", request_kind="fresh")
-        await asyncio.sleep(0)
-        assert old_fresh.done()
-        assert not new_resume.done()
-
-        await lb.release_server("s0", request_kind="fresh")
-        await asyncio.sleep(0)
-        assert new_resume.done()
-        await lb.release_server("s0", request_kind="continuation")
-
-    def test_target_wait_must_be_positive(self):
-        with pytest.raises(ValueError, match="target_wait_seconds"):
-            EffectiveCostAdmissionRequestLoadBalancer(
-                servers={"s0": None},
-                router_kwargs={
-                    "max_concurrent_requests": 1,
-                    "target_wait_seconds": 0,
-                },
-            )
 
 
 class TestGetRouterHandlePrecedence:

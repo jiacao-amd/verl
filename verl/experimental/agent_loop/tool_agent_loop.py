@@ -71,8 +71,6 @@ class AgentData:
         metrics: dict[str, Any],
         request_id: str,
         tools_kwargs: dict[str, Any],
-        base_priority: int,
-        policy_version: Optional[int],
     ):
         self.messages = messages
         self.image_data = image_data
@@ -82,8 +80,6 @@ class AgentData:
         self.metrics = metrics
         self.request_id = request_id
         self.tools_kwargs = tools_kwargs
-        self.base_priority = base_priority
-        self.policy_version = policy_version
 
         # State variables
         self.prompt_ids: list[int] = []
@@ -161,8 +157,6 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
-            base_priority=int(priority),
-            policy_version=kwargs.get("policy_version"),
         )
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
@@ -323,11 +317,9 @@ class ToolAgentLoop(AgentLoopBase):
             request_kind=request_kind,
             turn_index=agent_data.assistant_turns,
             attempt_index=0,
-            base_priority=agent_data.base_priority,
             prompt_tokens=prompt_tokens,
             estimated_uncached_tokens=estimated_uncached_tokens,
             enqueued_at=time.time(),
-            policy_version=agent_data.policy_version,
             expected_output_tokens=expected_output_tokens,
         )
 

@@ -34,10 +34,6 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
-from verl.workers.rollout.request_scheduling import (
-    RolloutRequestContext,
-    load_request_priority_policy,
-)
 from verl.workers.rollout.router import GlobalRequestLoadBalancer  # noqa: F401
 from verl.workers.rollout.utils import update_prometheus_config
 
@@ -71,39 +67,6 @@ class LLMServerClient:
         # Balancer field declarations, queried lazily once.
         self._lb_require_acquire_fields: list[str] | None = None
         self._lb_require_release_fields: list[str] | None = None
-        rollout_config = getattr(getattr(config, "actor_rollout_ref", None), "rollout", None)
-        self._rollout_name = getattr(rollout_config, "name", None)
-        engine_kwargs = getattr(rollout_config, "engine_kwargs", {}) or {}
-        sglang_engine_kwargs = engine_kwargs.get("sglang", {}) or {}
-        self._sglang_priority_enabled = bool(sglang_engine_kwargs.get("enable_priority_scheduling", False))
-        self._sglang_low_priority_values_first = bool(
-            sglang_engine_kwargs.get("schedule_low_priority_values_first", False)
-        )
-        multi_turn_config = getattr(rollout_config, "multi_turn", None)
-        self._request_priority_policy = load_request_priority_policy(
-            getattr(multi_turn_config, "request_priority_policy", None),
-            getattr(multi_turn_config, "request_priority_policy_kwargs", None),
-        )
-        if (
-            self._request_priority_policy is not None
-            and self._rollout_name == "sglang"
-            and not self._sglang_priority_enabled
-        ):
-            raise ValueError(
-                "SGLang request priority policy requires rollout.engine_kwargs.sglang.enable_priority_scheduling=true"
-            )
-
-    def _request_priority(self, request_context: dict[str, Any] | None) -> int | None:
-        if self._request_priority_policy is None or request_context is None:
-            return None
-        context = RolloutRequestContext.from_dict(request_context)
-        return self._request_priority_policy.get_priority(context)
-
-    def _backend_priority(self, priority: int) -> int:
-        """Translate verl's lower-value-first priority to backend semantics."""
-        if self._rollout_name == "sglang" and not self._sglang_low_priority_values_first:
-            return -priority
-        return priority
 
     async def _acquire_server(self, request_id: str, **extra) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -167,10 +130,6 @@ class LLMServerClient:
             mm_processor_kwargs=mm_processor_kwargs,
             **kwargs,
         )
-        if "priority" not in kwargs:
-            priority = self._request_priority(request_context)
-            if priority is not None:
-                kwargs["priority"] = priority
         request_kind = request_context.get("request_kind") if isinstance(request_context, dict) else None
         try:
             multimodal_kwargs = {}
@@ -187,14 +146,10 @@ class LLMServerClient:
             kwargs.pop("request_context", None)
             if self.config.actor_rollout_ref.rollout.name == "sglang":
                 video_data = mm_processor_output
-            priority = kwargs.pop("priority", None)
-            priority_supported = self._rollout_name == "vllm" or (
-                self._rollout_name == "sglang" and self._sglang_priority_enabled
-            )
+            # priority is only supported by vLLM rollout server.
+            priority = kwargs.pop("priority", 0)
             priority_kwargs = (
-                {"priority": self._backend_priority(int(priority))}
-                if priority is not None and priority_supported
-                else {}
+                {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
             output: TokenOutput = await server.generate.remote(
                 request_id=self._vllm_request_id(request_id),  # use new request_id for each turn

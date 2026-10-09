@@ -26,12 +26,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 from verl.tools.schemas import ToolResponse
 from verl.workers.rollout.request_scheduling import (
-    EffectiveCostPriorityPolicy,
-    LinearRequestCostEstimator,
-    RequestKindPriorityPolicy,
     RolloutRequestContext,
     RolloutRequestKind,
-    effective_request_cost,
 )
 
 
@@ -118,8 +114,6 @@ def _make_generation_agent_data(*, assistant_turns: int, prompt_ids: list[int], 
         prompt_ids=prompt_ids,
         last_model_sequence_length=previous_length,
         response_mask=[],
-        base_priority=7,
-        policy_version=11,
         image_data=None,
         video_data=None,
         mm_processor_output=None,
@@ -225,7 +219,7 @@ class TestCallToolErrorHandling(unittest.IsolatedAsyncioTestCase):
 
 
 class TestToolAgentRequestScheduling(unittest.IsolatedAsyncioTestCase):
-    async def test_default_policy_preserves_existing_backend_behavior(self):
+    async def test_generation_sends_admission_metadata_without_backend_priority(self):
         loop = _make_generation_loop()
         agent_data = _make_generation_agent_data(
             assistant_turns=0,
@@ -242,12 +236,10 @@ class TestToolAgentRequestScheduling(unittest.IsolatedAsyncioTestCase):
         assert context["request_kind"] == "fresh"
         assert context["turn_index"] == 0
         assert context["attempt_index"] == 0
-        assert context["base_priority"] == 7
         assert context["prompt_tokens"] == 3
         assert context["estimated_uncached_tokens"] == 3
         assert context["expected_output_tokens"] == 16
         assert isinstance(context["enqueued_at"], float)
-        assert context["policy_version"] == 11
 
     async def test_request_context_distinguishes_fresh_and_continuation(self):
         loop = _make_generation_loop()
@@ -273,159 +265,12 @@ class TestToolAgentRequestScheduling(unittest.IsolatedAsyncioTestCase):
         assert second_call.kwargs["request_context"]["request_kind"] == "continuation"
         assert second_call.kwargs["request_context"]["estimated_uncached_tokens"] == 2
 
-    def test_effective_cost_applies_soft_aging(self):
-        context = RolloutRequestContext(
-            trajectory_id="trajectory-1",
-            request_kind=RolloutRequestKind.FRESH,
-            turn_index=0,
-            attempt_index=0,
-            base_priority=0,
-            prompt_tokens=100,
-            estimated_uncached_tokens=100,
-            enqueued_at=0.0,
-            expected_output_tokens=0,
-        )
-        estimator = LinearRequestCostEstimator()
-
-        assert (
-            effective_request_cost(
-                context,
-                wait_seconds=0,
-                target_wait_seconds=10,
-                cost_estimator=estimator,
-            )
-            == 100
-        )
-        assert (
-            effective_request_cost(
-                context,
-                wait_seconds=10,
-                target_wait_seconds=10,
-                cost_estimator=estimator,
-            )
-            == 50
-        )
-
-    def test_effective_cost_priority_is_monotonic_and_bounded(self):
-        policy = EffectiveCostPriorityPolicy(
-            target_wait_seconds=1,
-            cost_per_priority=100,
-            max_priority=8,
-            max_wait_seconds=5,
-            overdue_priority=-1,
-        )
-        policy._clock = lambda: 2.0
-        cheap = RolloutRequestContext(
-            trajectory_id="resume",
-            request_kind=RolloutRequestKind.CONTINUATION,
-            turn_index=1,
-            attempt_index=0,
-            base_priority=0,
-            prompt_tokens=8192,
-            estimated_uncached_tokens=32,
-            enqueued_at=1.0,
-            expected_output_tokens=0,
-        )
-        expensive = RolloutRequestContext(
-            trajectory_id="fresh",
-            request_kind=RolloutRequestKind.FRESH,
-            turn_index=0,
-            attempt_index=0,
-            base_priority=0,
-            prompt_tokens=8192,
-            estimated_uncached_tokens=8192,
-            enqueued_at=1.0,
-            expected_output_tokens=0,
-        )
-
-        assert policy.get_priority(cheap) < policy.get_priority(expensive)
-        assert policy.get_priority(expensive) == 8_000_000
-        policy._clock = lambda: 7.0
-        assert policy.get_priority(expensive) == -1_000_000
-
-    def test_effective_cost_priority_supports_shifted_negative_range(self):
-        policy = EffectiveCostPriorityPolicy(
-            target_wait_seconds=1,
-            cost_per_priority=100,
-            min_priority=-8,
-            max_priority=0,
-            max_wait_seconds=5,
-            overdue_priority=-9,
-        )
-        policy._clock = lambda: 2.0
-        cheap = RolloutRequestContext(
-            trajectory_id="resume",
-            request_kind=RolloutRequestKind.CONTINUATION,
-            turn_index=1,
-            attempt_index=0,
-            base_priority=0,
-            prompt_tokens=8192,
-            estimated_uncached_tokens=32,
-            enqueued_at=1.0,
-            expected_output_tokens=0,
-        )
-        expensive = RolloutRequestContext(
-            trajectory_id="fresh",
-            request_kind=RolloutRequestKind.FRESH,
-            turn_index=0,
-            attempt_index=0,
-            base_priority=0,
-            prompt_tokens=8192,
-            estimated_uncached_tokens=8192,
-            enqueued_at=1.0,
-            expected_output_tokens=0,
-        )
-
-        assert policy.get_priority(cheap) == -8_000_000
-        assert policy.get_priority(expensive) == 0
-        policy._clock = lambda: 7.0
-        assert policy.get_priority(expensive) == -9_000_000
-
-    def test_effective_cost_bucket_precedes_base_priority(self):
-        policy = EffectiveCostPriorityPolicy(
-            target_wait_seconds=10,
-            cost_per_priority=100,
-            min_priority=0,
-            max_priority=100,
-            priority_stride=1000,
-        )
-        policy._clock = lambda: 1.0
-        cheap = RolloutRequestContext(
-            trajectory_id="late-resume",
-            request_kind=RolloutRequestKind.CONTINUATION,
-            turn_index=1,
-            attempt_index=0,
-            base_priority=63,
-            prompt_tokens=8192,
-            estimated_uncached_tokens=32,
-            enqueued_at=1.0,
-            expected_output_tokens=0,
-        )
-        expensive = RolloutRequestContext(
-            trajectory_id="early-fresh",
-            request_kind=RolloutRequestKind.FRESH,
-            turn_index=0,
-            attempt_index=0,
-            base_priority=0,
-            prompt_tokens=8192,
-            estimated_uncached_tokens=8192,
-            enqueued_at=1.0,
-            expected_output_tokens=0,
-        )
-
-        assert policy.get_priority(cheap) < policy.get_priority(expensive)
-
-    def test_request_kind_policy_rejects_unknown_kind(self):
-        with self.assertRaisesRegex(ValueError, "Unknown rollout request kinds"):
-            RequestKindPriorityPolicy(priority_offsets={"unknown": 1})
-
     def test_request_context_serializes_enum_value(self):
         context = RolloutRequestContext(
             trajectory_id="trajectory-1",
             request_kind=RolloutRequestKind.RETRY,
             turn_index=2,
             attempt_index=1,
-            base_priority=0,
             prompt_tokens=12,
             estimated_uncached_tokens=4,
             enqueued_at=1.0,

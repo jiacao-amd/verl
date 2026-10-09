@@ -260,7 +260,7 @@ For example, one tested vLLM configuration uses:
    max_resume_burst_requests: 20
    fresh_max_wait_seconds: 60
 
-Then configure rollout without a request priority policy:
+Then configure rollout with FCFS backend scheduling:
 
 .. code:: yaml
 
@@ -641,7 +641,9 @@ priority differs by +0.52% and supplies no demonstrated gain. Preemptions
 remain zero and prefix-cache hit rates approximately 74.48%. The lower
 continuation latency does not justify either continuation-priority policy
 for throughput-oriented rollout. The limit-32 cases also remain slower than
-the best limit-64 FCFS configuration.
+the best limit-64 FCFS configuration. Backend-priority policies and SGLang
+priority forwarding have been removed from this change; the tables above
+record historical experiments, not supported configuration options.
 
 ``--enable-expert-parallel`` was measured separately after a limited correctness
 smoke evaluation. Base TP8 and EP both scored 24/24 on fixed-answer questions,
@@ -653,43 +655,6 @@ does not activate specialized MoE all-to-all kernels. Logs select
 ``AITER_MXFP4_BF16`` and ``MoEPrepareAndFinalizeNoDPEPModular``; TP all-reduce
 dispatch uses ``QUICK_REDUCE``, ``AITER_CUSTOM``, and ``PYNCCL``, with ``PYNCCL``
 on the EP group.
-
-Strict continuation priority is intended for latency-sensitive experiments, not
-as the default wall-time optimization. It can reduce continuation TTFT while
-delaying fresh requests that would otherwise unlock later tool and model turns.
-To experiment with it, configure
-``EffectiveCostAdmissionRequestLoadBalancer`` and
-``EffectiveCostPriorityPolicy``. The policy estimates request work as::
-
-   estimated_cost = (
-       prefill_weight * estimated_uncached_tokens
-       + decode_weight * expected_output_tokens
-         * (1 + prompt_tokens / decode_context_scale)
-   )
-   effective_cost = estimated_cost / (1 + wait_seconds / target_wait_seconds)
-
-Lower effective cost maps to higher backend scheduling priority. vLLM requires
-``scheduling_policy: priority``. The policy computes aging once, after router
-admission and before backend submission. It does not update a request's priority
-while that request waits inside vLLM, so ``max_wait_seconds`` is not a backend
-queue waiting-time bound. SGLang requires
-``enable_priority_scheduling: true`` and uses ``fcfs`` or ``lof`` as its base
-schedule policy. verl translates the priority direction when SGLang keeps its
-default higher-value-first behavior. For SGLang, configure:
-
-.. code:: yaml
-
-   actor_rollout_ref:
-     rollout:
-       name: sglang
-       engine_kwargs:
-         sglang:
-           enable_priority_scheduling: true
-           schedule_policy: fcfs
-
-``schedule_low_priority_values_first: true`` is also supported. When it is
-unset, verl negates its lower-value-first priority before sending the request so
-the ordering remains consistent across vLLM and SGLang.
 
 Next
 ----
