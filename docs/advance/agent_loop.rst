@@ -1,7 +1,7 @@
 Agent Loop
 ==========
 
-Last updated: 10/08/2026.
+Last updated: 10/09/2026.
 
 .. versionadded:: 0.4.2
    [status: alpha]
@@ -297,7 +297,8 @@ with generated output. Arrivals are pipelined, with synthetic tool waits of
 0.25, 0.5, 1, and 2 seconds, temperature zero, ``ignore_eos=true``, and streaming.
 Wall time starts at the common trajectory launch and ends when all 64 complete.
 
-All configurations use FCFS, prefix caching, FP8 KV cache, block size 16,
+The configurations in the eight-GPU comparison use FCFS, prefix caching, FP8 KV
+cache, block size 16,
 ``max_model_len=16384``, ``gpu_memory_utilization=0.93``, and disabled async
 scheduling. No backend request priority is sent. TP4 uses ``max_num_seqs=32``;
 TP8 uses ``max_num_seqs=64``. Both use ``max_num_batched_tokens=32768``.
@@ -473,6 +474,174 @@ waiting requests and are not sorted by priority each step. Priority also
 determines the preemption victim when KV allocation fails. Changing backend
 priority does not directly reduce the compute cost of running requests; measure
 full rollout wall time and verify queue overlap before attributing a gain to it.
+
+A separate backend-priority study on ``crsuse2-m2m-012`` retained the same
+TP8 limit-64/token-budget-32768 engine and cap-64 router. Four priority cases
+were interleaved in forward/reverse/forward order after workload warmup;
+FCFS was restarted, warmed, and repeated afterward. Every group has three
+hot repetitions, CV below 0.55%, no new FlyDSL kernels during rollout, and
+zero preemptions. Each repetition uses a new session prefix.
+
+.. list-table:: TP8 backend priority, full 64-trajectory rollout
+   :header-rows: 1
+   :widths: 25 31 24 10 10
+
+   * - Backend policy
+     - Three wall times (s)
+     - Mean +/- sample std (s)
+     - CV
+     - Trajectory/s
+   * - FCFS, restarted
+     - 12.244043, 12.257748, 12.240870
+     - 12.247554 +/- 0.008970
+     - 0.073%
+     - 5.2255
+   * - Priority, equal values
+     - 12.285194, 12.253561, 12.222918
+     - 12.253891 +/- 0.031139
+     - 0.254%
+     - 5.2228
+   * - Priority, strict continuation
+     - 12.187706, 12.195780, 12.198619
+     - 12.194035 +/- 0.005662
+     - 0.046%
+     - 5.2485
+   * - Priority, ordinal credit 16
+     - 12.261132, 12.280521, 12.198058
+     - 12.246570 +/- 0.043117
+     - 0.352%
+     - 5.2260
+   * - Priority, time credit 500 ms
+     - 12.263584, 12.279923, 12.157801
+     - 12.233770 +/- 0.066296
+     - 0.542%
+     - 5.2314
+
+Lower integer priority wins. Equal values use zero; strict continuation
+subtracts 1000000 from the trajectory ordinal, and ordinal credit subtracts
+16. The time-credit case orders requests by enqueue time, subtracting 500 ms
+for continuations and using the ordinal as a tie-breaker. All values are fixed
+at submission. Admission remains unchanged; these repetitions record zero
+burst admissions.
+
+Strict continuation priority has a 0.44% lower mean than restarted FCFS,
+while ordinal and time credits differ by 0.01% and 0.11%. These small differences
+do not establish a production improvement. In all 15 repetitions, the entire
+fresh wave completes before continuation submission. Ordinal-based priorities
+can still reorder competing continuations, so this comparison does not isolate
+a request-kind effect. Backend queue means are 0.557 seconds and prefix-cache
+hit rates approximately 74.48% across cases.
+Pooled fresh TTFT p95 ranges from 5.58 to 5.61 seconds; continuation TTFT p95
+ranges from 0.311 to 0.357 seconds. Retain FCFS pending a reproducible benefit
+on the production layout.
+
+The production-layout priority cross-check on ``crsuse2-m2m-185`` uses two
+simultaneous TP4 replicas with the same sticky 32+32 trajectory partition.
+FCFS is restarted before and after the three interleaved priority cases.
+The first FCFS formal group triggered new FlyDSL kernels and had 5.05% CV;
+it was rejected in full, retained, then re-warmed and repeated. All selected
+groups below have CV below 0.18%, no new FlyDSL kernels during rollout, and
+zero preemptions. The valid before/after FCFS means differ by 0.14%.
+
+.. list-table:: Two TP4 replicas, backend priority
+   :header-rows: 1
+   :widths: 25 31 24 10 10
+
+   * - Backend policy
+     - Three wall times (s)
+     - Mean +/- sample std (s)
+     - CV
+     - Trajectory/s
+   * - FCFS, before (repeated)
+     - 9.888150, 9.868042, 9.903479
+     - 9.886557 +/- 0.017772
+     - 0.180%
+     - 6.4734
+   * - FCFS, after
+     - 9.891837, 9.897796, 9.910132
+     - 9.899922 +/- 0.009331
+     - 0.094%
+     - 6.4647
+   * - Priority, equal values
+     - 9.893605, 9.898297, 9.895510
+     - 9.895804 +/- 0.002360
+     - 0.024%
+     - 6.4674
+   * - Priority, strict continuation
+     - 9.911562, 9.935168, 9.922941
+     - 9.923224 +/- 0.011806
+     - 0.119%
+     - 6.4495
+   * - Priority, ordinal credit 16
+     - 9.912575, 9.918807, 9.913883
+     - 9.915088 +/- 0.003286
+     - 0.033%
+     - 6.4548
+
+Strict continuation and ordinal-credit priorities are 0.24% and 0.15% slower
+than the final FCFS mean. All selected repetitions complete the entire fresh
+wave before continuation submission, with zero burst admissions. Keep the
+two-TP4 FCFS production recommendation.
+
+A separate TP8 limit-32 control on ``crsuse2-m2m-053`` keeps the same
+64-trajectory workload, router capacity 64, and token budget 32768. This creates
+fresh/continuation competition: only five or six fresh requests have completed
+when continuation submission starts. Four priority cases are interleaved after
+warmup; FCFS is restarted before and after. All groups have three repetitions
+and no new FlyDSL kernels during rollout. Priority-group CV is below 0.56%;
+the first FCFS group has 1.92% CV. Its mean drops by 2.31% after restart, so
+small cross-restart differences cannot be attributed to priority. The crossed
+equal-priority control provides the comparison within the priority service.
+
+.. list-table:: TP8 limit-32 queue-competition control
+   :header-rows: 1
+   :widths: 25 31 24 10 10
+
+   * - Backend policy
+     - Three wall times (s)
+     - Mean +/- sample std (s)
+     - CV
+     - Trajectory/s
+   * - FCFS, before
+     - 14.512110, 15.056744, 14.655122
+     - 14.741325 +/- 0.282365
+     - 1.915%
+     - 4.3415
+   * - FCFS, after
+     - 14.341505, 14.431253, 14.430709
+     - 14.401156 +/- 0.051659
+     - 0.359%
+     - 4.4441
+   * - Priority, equal values
+     - 14.400516, 14.341694, 14.383895
+     - 14.375369 +/- 0.030324
+     - 0.211%
+     - 4.4521
+   * - Priority, strict continuation
+     - 16.089346, 16.093785, 15.986320
+     - 16.056484 +/- 0.060804
+     - 0.379%
+     - 3.9859
+   * - Priority, ordinal credit 16
+     - 16.262072, 16.163818, 16.081904
+     - 16.169265 +/- 0.090207
+     - 0.558%
+     - 3.9581
+   * - Priority, fresh first
+     - 14.493295, 14.454957, 14.402374
+     - 14.450209 +/- 0.045646
+     - 0.316%
+     - 4.4290
+
+Strict continuation priority reduces continuation TTFT p95 from 2.098 to
+0.830 seconds versus the interleaved equal-priority control, but delays fresh
+wave completion from 7.123 to 10.092 seconds and increases rollout wall time
+by 11.69%. Ordinal credit 16 also increases wall time by 12.48%; fresh-first
+priority differs by +0.52% and supplies no demonstrated gain. Preemptions
+remain zero and prefix-cache hit rates approximately 74.48%. The lower
+continuation latency does not justify either continuation-priority policy
+for throughput-oriented rollout. The limit-32 cases also remain slower than
+the best limit-64 FCFS configuration.
 
 ``--enable-expert-parallel`` was measured separately after a limited correctness
 smoke evaluation. Base TP8 and EP both scored 24/24 on fixed-answer questions,
