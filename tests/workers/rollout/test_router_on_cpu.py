@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import ray
@@ -35,6 +35,27 @@ from verl.workers.rollout.router import (
 )
 
 MOCK_PLUGIN_FQN = __name__ + "._MockPluginLoadBalancer"
+
+
+@ray.remote
+class _PausedRolloutServer:
+    def __init__(self):
+        self.pending = None
+        self.fail = False
+
+    async def generate(self, **kwargs):
+        self.pending = asyncio.Event()
+        await self.pending.wait()
+        if self.fail:
+            raise RuntimeError("Backend generation failed")
+        return TokenOutput(token_ids=[1], log_probs=None)
+
+    def is_generating(self):
+        return self.pending is not None
+
+    def complete(self, fail=False):
+        self.fail = fail
+        self.pending.set()
 
 
 @ray.remote
@@ -221,9 +242,28 @@ class TestGetRouterHandlePluginExtensionYaml:
         ready, _ = ray.wait([resumed], timeout=0.1)
         assert ready == []
 
-        ray.get(lb.release_server.remote("s0", request_kind="fresh"))
+        ray.get(lb.release_server.remote("s0", request_id="fresh-0"))
         assert ray.get(resumed)[0] == "s0"
-        ray.get(lb.release_server.remote("s0", request_kind="continuation"))
+        ray.get(lb.release_server.remote("s0", request_id="resume-0"))
+
+    def test_saturated_admission_group_keeps_release_rpc_available(self, ray_session, tmp_path):
+        path = _write_router_yaml(
+            tmp_path, "verl.workers.rollout.router.SoftAdmissionRequestLoadBalancer", max_concurrent_requests=1
+        )
+        lb = get_router_handle({"s0": None}, router_config_path=path)
+        try:
+            ray.get(lb.acquire_server.remote("held"), timeout=10)
+            queued = [lb.acquire_server.remote(f"queued-{i}") for i in range(1001)]
+            deadline = time.monotonic() + 20
+            while ray.get(lb.get_status.remote(), timeout=10)["admission"]["queued_by_kind"]["fresh"] != 1000:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+
+            ray.get(lb.release_server.remote("s0", request_id="held"), timeout=10)
+            ready, _ = ray.wait(queued, timeout=10)
+            assert len(ready) == 1
+        finally:
+            ray.kill(lb)
 
 
 class TestRequireFields:
@@ -242,8 +282,111 @@ class TestRequireFields:
             servers={"s0": None},
             router_kwargs={"max_concurrent_requests": 4},
         )
-        assert lb.require_acquire_fields() == ["request_context"]
-        assert lb.require_release_fields() == ["request_kind"]
+        assert lb.require_acquire_fields() == ["request_context", "admission_id"]
+        assert lb.require_release_fields() == ["admission_id"]
+
+    @pytest.mark.asyncio
+    async def test_client_cancellation_removes_remote_waiter(self, ray_session, tmp_path):
+        path = _write_router_yaml(
+            tmp_path, "verl.workers.rollout.router.SoftAdmissionRequestLoadBalancer", max_concurrent_requests=1
+        )
+        lb = get_router_handle({"s0": None}, router_config_path=path)
+        client = LLMServerClient(OmegaConf.create({}), lb)
+        try:
+            await client._acquire_server("held", admission_id="held")
+            cancelled = asyncio.create_task(client._acquire_server("cancelled", admission_id="cancelled"))
+            deadline = time.monotonic() + 10
+            while (await lb.get_status.remote())["admission"]["queued_by_kind"]["fresh"] != 1:
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+            deadline = time.monotonic() + 10
+            while (await lb.get_status.remote())["admission"]["queued_by_kind"]["fresh"]:
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+            await lb.release_server.remote("s0", admission_id="held")
+            assert await lb.get_total_inflight.remote() == 0
+            assert (await client._acquire_server("next", admission_id="next"))[0] == "s0"
+            await lb.release_server.remote("s0", admission_id="next")
+        finally:
+            ray.kill(lb)
+
+    @pytest.mark.asyncio
+    async def test_client_cancellation_releases_grant_delivered_before_cancel(self, ray_session, tmp_path):
+        path = _write_router_yaml(
+            tmp_path, "verl.workers.rollout.router.SoftAdmissionRequestLoadBalancer", max_concurrent_requests=1
+        )
+        lb = get_router_handle({"s0": None}, router_config_path=path)
+        client = LLMServerClient(OmegaConf.create({}), lb)
+        original_shield = asyncio.shield
+        pending = []
+
+        def hold_delivery(future):
+            if not pending:
+                pending.append(future)
+                return asyncio.get_running_loop().create_future()
+            return original_shield(future)
+
+        try:
+            await client._acquire_server("held", admission_id="held")
+            with patch("verl.workers.rollout.llm_server.asyncio.shield", side_effect=hold_delivery):
+                cancelled = asyncio.create_task(client._acquire_server("cancelled", admission_id="cancelled"))
+                deadline = time.monotonic() + 10
+                while (await lb.get_status.remote())["admission"]["queued_by_kind"]["fresh"] != 1:
+                    assert time.monotonic() < deadline
+                    await asyncio.sleep(0.01)
+
+                await lb.release_server.remote("s0", admission_id="held")
+                while not pending[0].done():
+                    assert time.monotonic() < deadline
+                    await asyncio.sleep(0.01)
+                cancelled.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await cancelled
+            deadline = time.monotonic() + 10
+            while await lb.get_total_inflight.remote():
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+        finally:
+            ray.kill(lb)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend_fails", [False, True])
+    async def test_cancelled_client_keeps_slot_until_backend_generation_finishes(
+        self, ray_session, tmp_path, backend_fails
+    ):
+        path = _write_router_yaml(
+            tmp_path, "verl.workers.rollout.router.SoftAdmissionRequestLoadBalancer", max_concurrent_requests=1
+        )
+        server = _PausedRolloutServer.remote()
+        lb = get_router_handle({"s0": server}, router_config_path=path)
+        config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"name": "vllm", "full_determinism": False}}})
+        client = LLMServerClient(config, lb)
+        try:
+            generating = asyncio.create_task(client.generate("running", prompt_ids=[1], sampling_params={}))
+            deadline = time.monotonic() + 10
+            while not await server.is_generating.remote():
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+            generating.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await generating
+            queued = asyncio.create_task(client._acquire_server("next", admission_id="next"))
+            while (await lb.get_status.remote())["admission"]["queued_by_kind"]["fresh"] != 1:
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+            assert await lb.get_total_inflight.remote() == 1
+            assert not queued.done()
+
+            await server.complete.remote(fail=backend_fails)
+            assert (await asyncio.wait_for(queued, timeout=10))[0] == "s0"
+            await lb.release_server.remote("s0", admission_id="next")
+            assert await lb.get_total_inflight.remote() == 0
+        finally:
+            ray.kill(lb)
+            ray.kill(server)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -276,7 +419,11 @@ class TestRequireFields:
             assert "priority" not in backend_kwargs
         else:
             assert backend_kwargs["priority"] == expected_priority
-        client._release_server.assert_called_once_with("s0", request_id="request-0", request_kind="continuation")
+        admission_id = client._acquire_server.await_args.kwargs["admission_id"]
+        assert "admission_id" not in backend_kwargs
+        client._release_server.assert_called_once_with(
+            "s0", request_id="request-0", request_kind="continuation", admission_id=admission_id
+        )
 
     def test_client_acquire_serializes_only_declared_fields(self, ray_session, tmp_path):
         """Declarations are queried lazily exactly once (verified via the mock's
@@ -418,6 +565,65 @@ def _request_context(
 
 class TestSoftAdmissionRequestLoadBalancer:
     @pytest.mark.asyncio
+    async def test_late_release_cannot_free_another_attempt_of_same_trajectory(self):
+        lb = SoftAdmissionRequestLoadBalancer({"s0": None}, {"max_concurrent_requests": 1})
+        await lb.acquire_server("trajectory", admission_id="turn-0")
+        await lb.release_server("s0", admission_id="turn-0")
+        await lb.acquire_server("trajectory", admission_id="turn-1")
+        queued = asyncio.create_task(lb.acquire_server("other"))
+        await asyncio.sleep(0)
+
+        await lb.release_server("s0", admission_id="turn-0")
+        assert not queued.done()
+        assert lb.get_total_inflight() == 1
+        await lb.release_server("s0", admission_id="turn-1")
+        assert (await queued)[0] == "s0"
+        await lb.release_server("s0", request_id="other")
+        assert lb.get_total_inflight() == 0
+
+    @pytest.mark.asyncio
+    async def test_removed_server_grants_do_not_block_replacement_or_late_completion(self):
+        lb = SoftAdmissionRequestLoadBalancer({"s0": None}, {"max_concurrent_requests": 1})
+        await lb.acquire_server("trajectory", admission_id="old")
+        queued = asyncio.create_task(lb.acquire_server("trajectory", admission_id="new"))
+        await asyncio.sleep(0)
+
+        lb.remove_servers(["s0"])
+        assert lb.get_total_inflight() == 0
+        lb.add_servers({"s0": None})
+        assert (await queued)[0] == "s0"
+        await lb.release_server("s0", admission_id="old")
+        assert lb.get_total_inflight() == 1
+        lb.add_servers({"s0": None})
+        assert lb.get_total_inflight() == 1
+        await lb.release_server("s0", admission_id="new")
+        assert lb.get_total_inflight() == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("early_burst", [0, 1])
+    async def test_fresh_wave_blocks_burst_by_default_and_when_overdue(self, early_burst):
+        config = {"max_concurrent_requests": 1, "max_resume_burst_requests": 1, "fresh_max_wait_seconds": 5}
+        if early_burst:
+            config["fresh_wave_max_resume_burst_requests"] = early_burst
+        lb = SoftAdmissionRequestLoadBalancer({"s0": None}, config)
+        now = [0.0]
+        lb._clock = lambda: now[0]
+        await lb.acquire_server("running")
+        fresh = asyncio.create_task(lb.acquire_server("fresh"))
+        await asyncio.sleep(0)
+        now[0] = 6.0 if early_burst else 0.0
+        resume = asyncio.create_task(lb.acquire_server("resume", _request_context("continuation")))
+        await asyncio.sleep(0)
+
+        assert not resume.done()
+        assert lb.get_status()["admission"]["resume_burst_target"] == 0
+        await lb.release_server("s0", request_id="running")
+        await fresh
+        await resume
+        await lb.release_server("s0", request_id="fresh")
+        await lb.release_server("s0", request_id="resume")
+
+    @pytest.mark.asyncio
     async def test_base_capacity_is_work_conserving(self):
         lb = SoftAdmissionRequestLoadBalancer(
             servers={"s0": None},
@@ -434,14 +640,14 @@ class TestSoftAdmissionRequestLoadBalancer:
         queued_resume = asyncio.create_task(lb.acquire_server("resume-0", _request_context("continuation")))
         await asyncio.sleep(0)
 
-        await lb.release_server("s0", request_kind="fresh")
+        await lb.release_server("s0", request_id="fresh-0")
         await asyncio.sleep(0)
         assert queued_resume.done()
         status = lb.get_status()["admission"]
         assert status["admitted_by_kind"]["continuation"] == 1
 
-        await lb.release_server("s0", request_kind="fresh")
-        await lb.release_server("s0", request_kind="continuation")
+        await lb.release_server("s0", request_id="fresh-1")
+        await lb.release_server("s0", request_id="resume-0")
         assert lb.get_status()["total_inflight"] == 0
 
     @pytest.mark.asyncio
@@ -462,7 +668,7 @@ class TestSoftAdmissionRequestLoadBalancer:
         await asyncio.sleep(0)
 
         now[0] = 6.0
-        await lb.release_server("s0", request_kind="continuation")
+        await lb.release_server("s0", request_id="resume-0")
         await asyncio.sleep(0)
         assert queued_fresh.done()
         assert not queued_resume.done()
@@ -470,10 +676,10 @@ class TestSoftAdmissionRequestLoadBalancer:
         assert status["mean_wait_seconds_by_kind"]["fresh"] == 6.0
         assert status["max_wait_seconds_by_kind"]["fresh"] == 6.0
 
-        await lb.release_server("s0", request_kind="fresh")
+        await lb.release_server("s0", request_id="fresh-0")
         await asyncio.sleep(0)
         assert queued_resume.done()
-        await lb.release_server("s0", request_kind="retry")
+        await lb.release_server("s0", request_id="resume-1")
 
     @pytest.mark.parametrize(
         ("router_kwargs", "message"),
@@ -522,6 +728,7 @@ class TestSoftAdmissionRequestLoadBalancer:
             router_kwargs={
                 "max_concurrent_requests": 2,
                 "max_resume_burst_requests": 2,
+                "fresh_wave_max_resume_burst_requests": 2,
             },
         )
 
@@ -601,6 +808,7 @@ class TestSoftAdmissionRequestLoadBalancer:
             router_kwargs={
                 "max_concurrent_requests": 2,
                 "max_resume_burst_requests": 2,
+                "fresh_wave_max_resume_burst_requests": 2,
             },
         )
 

@@ -238,17 +238,32 @@ request. The first request is classified as ``fresh``; requests after a tool
 call are ``continuation``; partial-rollout attempts are ``retry``. Scheduling is
 disabled by default, so existing rollout behavior is unchanged.
 
-For throughput-oriented vLLM rollouts, prefer FIFO backend scheduling with a
-resume-only admission burst. The base admission capacity remains available to
-all requests, while continuation and retry requests may temporarily use extra
-slots after returning from tool execution. The burst size is calculated from
-current fresh and resume pressure, capped by
+Use FCFS backend scheduling and enable resume-only admission burst only after
+validating full rollout wall time for the intended workload. The base admission
+capacity remains available to all requests, while continuation and retry
+requests may temporarily use extra slots after returning from tool execution.
+The burst size is calculated from current fresh and resume pressure, capped by
 ``max_resume_burst_requests``, and returns to zero when no resume request is
 present. It does not reserve idle capacity in advance or let resumed requests
-strictly overtake fresh requests in the backend scheduler. An optional
-``fresh_wave_max_resume_burst_requests`` cap can keep that burst smaller while
-fresh requests remain queued, then allow it to expand after the fresh queue
-drains.
+strictly overtake fresh requests in the backend scheduler.
+``fresh_wave_max_resume_burst_requests`` defaults to zero while fresh requests
+remain queued; configure a small nonzero cap only after measuring it. The
+larger burst cap applies after the router's fresh queue drains, which means
+those requests were admitted, not that their backend computation finished.
+When the oldest queued fresh request reaches ``fresh_max_wait_seconds``, the
+router stops admitting additional burst requests while fresh work is overdue.
+Already admitted requests continue; this threshold is an admission protection,
+not a bound on end-to-end latency.
+
+Each model attempt carries a separate admission ID. Completion and
+cancellation release that attempt exactly once, including cancellation racing
+with admission. If the client cancels after backend generation starts, the
+slot remains occupied until that backend call completes or fails. Removing a
+server retires its outstanding grants; late completion cannot release a grant
+from its replacement. Removal stops routing
+and clears accounting; the caller remains responsible for stopping the removed
+server's generation. The Ray actor uses separate admission and control
+concurrency groups so queued acquires cannot block release or server updates.
 
 For example, one tested vLLM configuration uses:
 
@@ -278,6 +293,23 @@ These values are workload-specific starting points. Tune the backend
 running-request limit, per-iteration token budget, base capacity, fresh-wave
 burst cap, and post-fresh burst cap jointly for the model, prompt length, tool
 latency distribution, and rollout batch size.
+
+The plugin is opt-in through ``router_config_path`` and
+``max_resume_burst_requests`` defaults to zero. Removing ``router_config_path``
+restores the default load balancer. Setting only the burst cap to zero still
+retains the plugin's base concurrency limit. The router does not infer backend
+headroom from request counts or GPU utilization and does not automatically tune
+queue or KV-cache thresholds.
+
+For performance validation, keep the engine and base admission capacity fixed,
+then compare burst disabled and enabled with warmup, at least three hot
+repetitions, crossed order, and distinct session IDs. Measure full rollout wall
+time, fresh and continuation TTFT, backend queueing, and preemption. Include
+different trajectory counts, prompt/output lengths, tool waits, and cache
+settings before extending a workload-specific recommendation. The following
+historical results do not establish a benefit for every workload.
+They predate the admission-lifecycle fixes above; the current implementation
+still needs a controlled GPU comparison with the same engine and base capacity.
 
 MiMo-V2.6-Flash on eight MI355X GPUs
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
