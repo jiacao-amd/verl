@@ -309,7 +309,9 @@ different trajectory counts, prompt/output lengths, tool waits, and cache
 settings before extending a workload-specific recommendation. The following
 historical results do not establish a benefit for every workload.
 They predate the admission-lifecycle fixes above; the current implementation
-still needs a controlled GPU comparison with the same engine and base capacity.
+has also been exercised in the controlled LoRA RL workload below. That short
+training workload does not establish a speedup or revalidate the historical
+long-prompt serving results with the lifecycle fixes.
 
 MiMo-V2.6-Flash on eight MI355X GPUs
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -687,6 +689,104 @@ does not activate specialized MoE all-to-all kernels. Logs select
 ``AITER_MXFP4_BF16`` and ``MoEPrepareAndFinalizeNoDPEPModular``; TP all-reduce
 dispatch uses ``QUICK_REDUCE``, ``AITER_CUSTOM``, and ``PYNCCL``, with ``PYNCCL``
 on the EP group.
+
+Full MiMo multi-turn LoRA RL validation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The admission-lifecycle implementation at ``ef215e77`` was exercised with
+the same full MiMo checkpoint above on eight MI355X GPUs. Each independent
+run uses 16 prompts with four samples each: 64 trajectories per training
+iteration. Every trajectory generates a ``lookup_value(record_id)`` tool
+call, waits 0.25, 0.5, 1, or 2 seconds for the hidden value, and generates
+the final answer. Rule reward checks the answer and exactly one tool call,
+with a small concision preference to produce within-group reward variation.
+Initial prompts contain 166 tokens; prompt/response caps are 512/256 and
+the model limit is 1024. Sampling uses temperature 0.7, top-p 0.95, seed
+8136, and unshuffled data.
+
+The actor freezes the full BF16 text backbone and trains rank-8, alpha-16
+LoRA adapters on attention QKV and output projections with GRPO and KL
+coefficient 0.001. Megatron uses TP2/PP2/EP4/ETP1 with CPU parameter and
+optimizer offload. Rollout uses one TP8 vLLM replica with FCFS, sequence
+limit 64, token budget 32768, FP8 KV cache, prefix caching, eager execution,
+and GPU memory fraction 0.35. Both cases use the same admission router at
+capacity 40: burst disabled has caps 0/0; enabled has fresh-wave/resume caps
+1/20. No backend request-kind priority is sent.
+
+This validation requires experimental MiMo checkpoint import/refit and ROCm
+runtime compatibility outside this scheduling change. The training image is
+``amdagi/verl-dev:rocm7.15_torch2.12_0904_py312``; Megatron Bridge is pinned to
+``574fc53505492acda3bc8b5eae913a85b6e24840`` and MCore to
+``6a3660905a2736b5670baed1ca5954372937918b``. Actor/reference execution uses
+deterministic algorithms and a validity-mask translation. These results do
+not establish MiMo training support in an unmodified default runtime.
+
+The independent runs follow crossed order off/on/on/off, each starting from
+the same checkpoint, adapter initialization, data, and seed. One warmup
+training iteration is excluded from timing, followed by three measured
+iterations. Input/tool records, runtime source hashes, and initial serving
+text-attention hashes agree across runs.
+
+.. list-table:: Real 64-trajectory LoRA RL iterations (warmup excluded)
+   :header-rows: 1
+   :widths: 17 31 26 26
+
+   * - Independent run
+     - Three complete steps (s)
+     - Step mean +/- sample std (s)
+     - Actual rollout mean +/- sample std (s)
+   * - Burst off, first
+     - 205.473637, 197.194280, 203.683277
+     - 202.117065 +/- 4.356226
+     - 5.780783 +/- 0.463233
+   * - Burst on, first
+     - 197.056206, 197.905741, 206.460742
+     - 200.474230 +/- 5.201844
+     - 5.794251 +/- 0.316471
+   * - Burst on, second
+     - 195.269226, 201.885229, 210.762591
+     - 202.639015 +/- 7.774139
+     - 5.764373 +/- 0.085720
+   * - Burst off, second
+     - 196.477585, 204.146509, 191.084657
+     - 197.236251 +/- 6.563892
+     - 5.611598 +/- 0.189048
+
+Complete steps include reward, actor/reference log-probs, GRPO advantages,
+backward/optimizer, and actor-to-vLLM weight publication. Actual rollout wall
+time spans the first model-turn start through the last model-turn completion,
+including tool waits. Output artifact dumping adds approximately 0.06 seconds
+per iteration and is outside the complete-step timer.
+
+All four runs exit successfully: 1,024/1,024 correct answers, 1,024 actual
+tool calls, and 2,048 model turns including warmup. Each iteration has finite,
+nonzero gradients and changed adapters on all eight training ranks, changed
+published text-attention hashes on all eight serving ranks, and expected
+weight versions 0 through 4. Rollouts have zero version staleness. Router
+queues and inflight counts drain before sleep/training/sync; after each run,
+all eight GPUs have zero allocated VRAM and no KFD processes.
+The on runs trigger 27/18/13/12 and 34/14/21/24 burst admissions per iteration,
+reaching 60 admitted requests; off remains at 40 with zero burst admissions.
+
+Pooling six measured training iterations per mode gives complete-step means
+199.676658 seconds off and 201.556622 seconds on (+0.94%), and actual rollout
+means 5.696191 seconds off and 5.779312 seconds on (+1.46%). Matching-step
+rollout differences change sign: -1.79%, +4.18%, and +2.31% for steps 2, 3,
+and 4. Sequential RL iterations change weights and sampled outputs, and
+complete-step variation exceeds 2%; these are not identical serving
+repetitions. Weight publication alone averages approximately 140 seconds
+and its variation cannot be attributed to burst. There is no demonstrated
+stable speedup in this workload; keep burst opt-in.
+
+Initial actor/reference log-probs match exactly, and a separate full
+actor/serving prefill probe has cosine similarity 0.996863 with matching
+next token. Updated BF16 actor and quantized serving log-probs still differ;
+serving log-probs also include sampling transforms. Correct answers and
+changed weights establish this short task and lifecycle, not convergence
+or broad numerical equivalence. TTFT is not captured, per-request
+preemption is unavailable, and five-second GPU sampling is sparse during
+short rollouts. Checkpoint save/resume and dual-replica training are not
+covered by this experiment.
 
 Next
 ----
