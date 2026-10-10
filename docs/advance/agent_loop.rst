@@ -1,7 +1,7 @@
 Agent Loop
 ==========
 
-Last updated: 10/09/2026.
+Last updated: 10/10/2026.
 
 .. versionadded:: 0.4.2
    [status: alpha]
@@ -265,7 +265,7 @@ and clears accounting; the caller remains responsible for stopping the removed
 server's generation. The Ray actor uses separate admission and control
 concurrency groups so queued acquires cannot block release or server updates.
 
-For example, one tested vLLM configuration uses:
+For example, one tested single-TP4 vLLM configuration uses:
 
 .. code:: yaml
 
@@ -309,9 +309,9 @@ different trajectory counts, prompt/output lengths, tool waits, and cache
 settings before extending a workload-specific recommendation. The following
 historical results do not establish a benefit for every workload.
 They predate the admission-lifecycle fixes above; the current implementation
-has also been exercised in the controlled LoRA RL workload below. That short
-training workload does not establish a speedup or revalidate the historical
-long-prompt serving results with the lifecycle fixes.
+has also been exercised in the controlled LoRA RL and rollout-only workloads
+below. The short training workload validates the lifecycle; the serving
+comparisons show both a workload-specific benefit and a regression.
 
 MiMo-V2.6-Flash on eight MI355X GPUs
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -778,6 +778,12 @@ repetitions. Weight publication alone averages approximately 140 seconds
 and its variation cannot be attributed to burst. There is no demonstrated
 stable speedup in this workload; keep burst opt-in.
 
+This two-turn task validates the training lifecycle, not the time breakdown
+of long agentic RL tasks. Its roughly 40 generated tokens per trajectory and
+experimental full-model LoRA publication make generation short and publication
+expensive. Do not extrapolate these phase proportions to workloads with tens
+of model turns and thousands of generated tokens.
+
 Initial actor/reference log-probs match exactly, and a separate full
 actor/serving prefill probe has cosine similarity 0.996863 with matching
 next token. Updated BF16 actor and quantized serving log-probs still differ;
@@ -787,6 +793,159 @@ or broad numerical equivalence. TTFT is not captured, per-request
 preemption is unavailable, and five-second GPU sampling is sparse during
 short rollouts. Checkpoint save/resume and dual-replica training are not
 covered by this experiment.
+
+Current-code rollout-only comparison
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The admission-lifecycle implementation at ``502bd341`` was also measured with
+the full MiMo-V2.6-Flash-RL checkpoint on eight MI355X GPUs. The server uses the
+same recovered vLLM runtime and model revision listed above, TP8, sequence
+limit 64, token budget 32768, maximum length 16384, FP8 KV cache, block size
+16, prefix caching, FCFS, and disabled async scheduling. No backend priority
+is sent. Actor updates and weight publication are excluded.
+
+Both workloads have 64 trajectories, 8188 initial prompt tokens, pipelined
+arrivals, temperature zero, streaming, and ``ignore_eos=true``. Tool waits
+cycle through 0.25, 0.5, 1, and 2 seconds. The short workload generates four
+turns of 64 tokens each; the long workload generates twenty turns of 256
+tokens each. Continuations append the actual generated text and synthetic
+tool result. The longest measured context including output is 13916 tokens.
+These are controlled serving workloads, not real programming tasks or
+complete RL iterations.
+
+At base capacity 40, the isolated off/on comparison changes only burst caps
+from 0/0 to 1/20. Capacity 64 with burst disabled is a separate capacity
+reference. Each configuration has excluded warmups followed by three hot
+repetitions in crossed order, with distinct session IDs. Warmup continues
+until the last three runs have coefficient of variation at most 1%, range
+at most 2%, and no new FlyDSL cache entries. Wall time spans the common first
+trajectory start through the final trajectory completion, including tools.
+Post-completion metric collection is outside that timer.
+The recovered server returns HTTP 404 for prefix-cache reset. Cache isolation
+therefore uses distinct first 16-token blocks for every trajectory across
+cases, verified with the model tokenizer, rather than a successful cache reset.
+
+.. list-table:: Complete 64-trajectory generation batches (warmup excluded)
+   :header-rows: 1
+   :widths: 17 20 32 21 10
+
+   * - Workload
+     - Admission configuration
+     - Three wall times (s)
+     - Mean +/- sample std (s)
+     - Trajectory/s
+   * - Four turns x 64 tokens
+     - Capacity 40, burst off
+     - 13.741808, 13.732570, 13.678743
+     - 13.717707 +/- 0.034059
+     - 4.665503
+   * - Four turns x 64 tokens
+     - Capacity 40, burst 1/20
+     - 14.041931, 13.789393, 14.146454
+     - 13.992593 +/- 0.183572
+     - 4.573849
+   * - Four turns x 64 tokens
+     - Capacity 64, burst off
+     - 12.161859, 12.145972, 12.129763
+     - 12.145865 +/- 0.016048
+     - 5.269283
+   * - Twenty turns x 256 tokens
+     - Capacity 40, burst off
+     - 106.736657, 105.067431, 105.169389
+     - 105.657826 +/- 0.935685
+     - 0.605729
+   * - Twenty turns x 256 tokens
+     - Capacity 40, burst 1/20
+     - 96.345566, 94.756610, 96.145138
+     - 95.749105 +/- 0.865348
+     - 0.668414
+   * - Twenty turns x 256 tokens
+     - Capacity 64, burst off
+     - 85.661897, 85.872939, 85.983932
+     - 85.839589 +/- 0.163587
+     - 0.745577
+
+At equal capacity, burst increases short-workload wall time by 2.00% and
+reduces long-workload wall time by 9.38%. A separate crossed short-workload
+recheck also regresses: 13.764794 seconds off versus 14.135585 seconds on
+(+2.69%). All reported groups have variation below 2%, no preemption, and
+no new FlyDSL cache entries. Prefix-cache hit rates are approximately 74.48%
+for the short workload and 93.68% for the long workload.
+
+Capacity 64 with burst disabled is fastest for both workloads on this TP8
+engine. It reduces wall time by 11.46% and 18.76%, respectively, relative
+to capacity 40 with burst disabled. These are capacity-tuning improvements,
+not isolated burst improvements. Keep burst disabled for this configuration;
+the equal-capacity long-workload benefit does not justify selecting it over
+the faster capacity reference.
+
+For this TP8 engine and 64-trajectory batch, the measured router configuration
+is:
+
+.. code:: yaml
+
+   router_class: verl.workers.rollout.router.SoftAdmissionRequestLoadBalancer
+   max_concurrent_requests: 64
+   fresh_wave_max_resume_burst_requests: 0
+   max_resume_burst_requests: 0
+
+The HTTP harness instantiates the actual router directly. These results do
+not measure Ray ``LLMServerClient``, trainer completion polling, rewards,
+or weight synchronization. They establish complete-batch serving behavior
+and the need to validate the chosen capacity and burst together; they do
+not establish a complete-training speedup.
+
+The long workload was then exercised through unmodified
+``ToolAgentLoop._generate``, ``LLMServerClient``, and the Ray router, using an
+HTTP token adapter to the same vLLM server. The adapter returns actual token
+IDs; it does not replace model generation. The workload still controls turn
+counts and tool waits and does not run ``ToolAgentLoop.run``, model-selected
+tools, rewards, or the trainer.
+
+The first crossed client comparison records 107.385446 +/- 0.689585 seconds
+at capacity 40 with burst disabled, versus 97.303802 +/- 2.795733 seconds
+with burst enabled. The burst group's 2.87% variation exceeds the acceptance
+threshold, so it does not establish a stable client-path burst benefit.
+The initial capacity-64 group also triggered two new FlyDSL kernels during
+its first formal repetition; that entire group was rejected and repeated.
+
+For the capacity recheck, both configurations completed three fresh-session
+warmups with variation below 0.18%, range below 0.35%, and no new FlyDSL
+entries. Three subsequent hot repetitions use crossed order. Every batch
+completes 64 fresh and 1216 continuation requests, generating exactly 327680
+tokens. Admission counts drain to zero after each batch. Timing excludes
+Ray startup, final release reconciliation, and artifact collection.
+
+.. list-table:: Long generation through the actual Ray client (warmup excluded)
+   :header-rows: 1
+   :widths: 25 35 28 12
+
+   * - Admission configuration
+     - Three wall times (s)
+     - Mean +/- sample std (s)
+     - Trajectory/s
+   * - Capacity 40, burst off
+     - 108.417726, 110.727781, 110.566859
+     - 109.904122 +/- 1.289769
+     - 0.582326
+   * - Capacity 64, burst off
+     - 89.598522, 90.343653, 89.513875
+     - 89.818683 +/- 0.456602
+     - 0.712547
+
+Increasing capacity from 40 to 64 reduces complete-batch wall time by 18.28%
+and increases trajectory throughput by 22.36% through this client path.
+Variation is 1.17% and 0.51%, respectively, with zero preemptions, no new
+FlyDSL entries, and prefix-cache hit rates approximately 93.68%. Pooled fresh
+TTFT p95 improves from 7.984 to 5.721 seconds, and continuation TTFT p95 from
+2.357 to 0.785 seconds. Mean backend queue time rises from 0.050 to 0.119
+seconds; computed prefill throughput rises from 8035 to 9825 token/s and
+decode throughput from 2982 to 3648 token/s. Per-device mean GPU utilization
+ranges from 85.21-86.58% at capacity 40 and 82.11-83.49% at capacity 64.
+Lower mean utilization does not override the measured earlier batch completion.
+This validates the capacity recommendation through the client path, within
+the controlled workload's scope; it remains a generation result, not a
+complete-training speedup.
 
 Next
 ----
