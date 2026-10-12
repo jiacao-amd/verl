@@ -1,7 +1,7 @@
 Agent Loop
 ==========
 
-Last updated: 10/10/2026.
+Last updated: 10/12/2026.
 
 .. versionadded:: 0.4.2
    [status: alpha]
@@ -946,6 +946,220 @@ Lower mean utilization does not override the measured earlier batch completion.
 This validates the capacity recommendation through the client path, within
 the controlled workload's scope; it remains a generation result, not a
 complete-training speedup.
+
+Native input-chunk and graph tuning on heterogeneous MiMo rollouts
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A separate fixed-input replay uses the same full MiMo revision and recovered
+ROCm runtime, with 64 trajectories of 2--24 turns, 624 requests, 8188 initial
+prompt tokens and 256 generated tokens per request (159744 total). Subsequent
+input IDs are frozen, with approximately 291--304 uncached continuation tokens
+on TP8 and synthetic tool waits of 0.25/0.5/1/2 seconds. Timing ends when the
+last trajectory completes. Actor updates and weight publication are excluded.
+This differs from the four-turn/64-output-token workload above. Frozen future
+inputs provide a serving comparison; they do not validate autonomous quality
+or full training performance.
+
+Limiting native per-request input chunks to 2048 or 4096 did not improve wall
+time on ``crsuse2-m2m-265``. Warmup-excluded three-run means were 83.915330
++/- 0.468319 seconds for native scheduling, 84.034485 +/- 0.131115 for 2048,
+and 83.972205 +/- 0.355506 for 4096. Keep these caps disabled for this workload.
+
+On AAC ``mi355-gpu-19``, expanding native piecewise graph coverage improved
+TP8 wall time while retaining the original decode capture sizes. TP8 uses
+sequence limit 64, token budget 32768, FCFS, no async scheduling, no backend
+priority and zero router burst at capacity 64. Model/revision, FP8 KV,
+block size 16, maximum context 16384 and recovered attention overlays are
+unchanged. Only capture sizes change; this is backend execution tuning,
+rather than a new request ordering policy.
+
+The original captures are 1/2/4/8 and multiples of eight from 16 through 128.
+Sparse coverage adds 512/1024/2048/4096; dense coverage instead adds multiples
+of 320 through 3840 and 4096. The comparison restarts engines in original ->
+sparse -> dense -> original order. Each has independent NVMe caches, unique
+session salts, at least three consecutive stable hot warmups, then three
+formal repetitions. Every formal run has identical input IDs/counts, zero
+preemptions, zero observed compile-cache writes and drained queues. Before/after
+baseline drift is 0.13%; all formal CVs are below 0.38%. Absolute times from
+AAC and CRS are not compared as an optimization gain.
+
+.. list-table:: Heterogeneous fixed-input replay on eight MI355X GPUs
+   :header-rows: 1
+   :widths: 25 35 28 12
+
+   * - Configuration
+     - Three wall times (s)
+     - Mean +/- sample std (s)
+     - Trajectory/s
+   * - TP8, original captures through 128, before
+     - 83.352024, 83.811070, 83.690976
+     - 83.618023 +/- 0.238060
+     - 0.765385
+   * - TP8, sparse coverage through 4096
+     - 80.918479, 81.136041, 81.189265
+     - 81.081262 +/- 0.143463
+     - 0.789332
+   * - TP8, dense coverage through 4096
+     - 80.975272, 80.533997, 80.397180
+     - 80.635483 +/- 0.302113
+     - 0.793695
+   * - TP8, original captures, after
+     - 83.651763, 83.781839, 83.741394
+     - 83.724999 +/- 0.066570
+     - 0.764407
+   * - Two simultaneous TP4 replicas, deployment reference
+     - 78.465533, 78.555902, 78.771272
+     - 78.597569 +/- 0.157071
+     - 0.814275
+
+Sparse coverage reduces complete-batch wall time by 3.03--3.16% against the
+two baselines, reproducing an earlier same-node three-run comparison. Dense
+coverage reduces it by 3.57--3.69%, but is only 0.55% faster than sparse and
+loses their first paired repetition. These results support a small observed
+mean difference; they do not establish general superiority of dense coverage.
+
+.. list-table:: Supporting metrics, means across the same three repetitions
+   :header-rows: 1
+   :widths: 36 16 16 16 16
+
+   * - Metric
+     - Original before
+     - Sparse4096
+     - Dense4096
+     - Original after
+   * - Fresh TTFT p95 (ms)
+     - 5797.212
+     - 5676.794
+     - 5761.040
+     - 5721.662
+   * - Continuation TTFT p95 (ms)
+     - 347.689
+     - 242.984
+     - 239.559
+     - 340.411
+   * - Backend queue (s)
+     - 0.229421
+     - 0.221517
+     - 0.217200
+     - 0.218993
+   * - Computed input token/s
+     - 8251.041
+     - 8509.160
+     - 8556.264
+     - 8240.457
+   * - Decode token/s
+     - 1910.412
+     - 1970.176
+     - 1981.082
+     - 1907.961
+   * - Final trajectory backend calls (s)
+     - 60.723
+     - 58.243
+     - 57.743
+     - 60.782
+
+Prefix-cache hit rate is 89.15% in every group and per-device mean GPU activity
+is approximately 91--93%. Final-trajectory tool waits remain approximately
+22.28 seconds. The saving therefore reaches final-trajectory completion;
+client backend durations include queue and delivery time and do not isolate
+a GPU kernel mechanism. TTFT entries are means of per-repetition p95s.
+
+Graph memory increases from 2.25 GiB per rank to 2.87/3.73 GiB. Reported KV
+capacity falls from 12279247 tokens to 12039951/11995387. Dense coverage costs
+another 0.86 GiB per rank for its small extra timing benefit. Zero preemptions
+here do not establish safety for larger contexts or concurrency. Keep capture
+tuning opt-in, check memory headroom, and preserve original decode sizes when
+extending coverage. verl already forwards ``rollout.cudagraph_capture_sizes``
+to vLLM; this experiment requires no additional router checks or code changes.
+
+To reproduce the sparse capture list with the same TP8 engine settings:
+
+.. code:: yaml
+
+   actor_rollout_ref:
+     rollout:
+       cudagraph_capture_sizes:
+         [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88,
+          96, 104, 112, 120, 128, 512, 1024, 2048, 4096]
+
+The simultaneous TP4 reference sends 32 sticky trajectories to each replica
+on GPU 0--3 and 4--7 with matching NUMA placement. Each engine uses sequence
+limit 32 and token budget 32768; global router capacity remains 64 with burst
+disabled. Its three-run CV is 0.20%. It allocates 256 CPUs instead of TP8's
+128/NUMA0, and native hybrid KV alignment is 32 on TP4 versus 16 on TP8. TP4
+therefore computes 698892 input tokens versus 689932 despite identical prompts.
+This earlier same-node run is a practical deployment comparison, including
+CPU/NUMA placement and cache alignment, rather than an isolated topology or
+router scheduling improvement.
+
+Actual model-selected tool/output quality remains a separate validation gate.
+The first four-task baseline smoke correctly read all 46 hidden records, but
+two final answers hit the harness's 256-token per-request cap. A new protocol
+raised that allowance equally to 1024 for every phase. Its four-task smoke
+passed, but its first 64-task warmup read all records correctly and produced
+two arithmetic errors (62/64 correct final answers), without truncation. Both
+protocols stopped before any formal live comparison or graph candidate. These
+failures do not show a graph-induced regression, and fixed-input timing alone
+does not establish live-task quality.
+
+A new live workload keeps the same 64 hidden record chains and delays, and
+adds a generic calculator tool. The model must read every record, supply all
+values in order to ``add_integers``, then return its sum. The calculator sees
+only model-supplied values, not the hidden expected answer. Scoring checks
+the read sequence, calculator input/order, invocation after the final read,
+final answer, and normal termination. This exercises current
+``ToolAgentLoop.run``, actual tool calls and model-chosen output lengths.
+It excludes actor updates and model publication. Its shorter initial prompts
+and natural outputs differ from the fixed-input replay; absolute times are
+not compared between the two workloads.
+
+On the same AAC node, original -> sparse4096 -> original uses independent
+caches and session salts, at least three consecutive stable warmups and three
+formal repetitions per phase. All nine formal batches have 64/64 correct
+tasks, 624 successful requests, no truncation, no preemptions, no observed
+compile-cache writes, and drained router/backend queues. All eight GPUs are
+released with zero use/VRAM and no KFD processes afterward.
+
+.. list-table:: Live MiMo tool-loop inference with a calculator
+   :header-rows: 1
+   :widths: 22 30 24 24
+
+   * - Configuration
+     - Three wall times (s)
+     - Mean +/- sample std (s)
+     - Generated tokens in each run
+   * - Original captures, before
+     - 32.071408, 32.485914, 32.694570
+     - 32.417297 +/- 0.317197
+     - 18893, 18497, 18783
+   * - Sparse4096
+     - 31.516414, 31.839362, 31.418132
+     - 31.591303 +/- 0.220374
+     - 19006, 18744, 18693
+   * - Original captures, after
+     - 32.703211, 32.527420, 32.090046
+     - 32.440226 +/- 0.315745
+     - 18975, 18724, 18876
+
+Sparse coverage reduces live complete-batch wall time by 2.55--2.62% against
+the before/after baselines; baseline drift is 0.07% and formal CVs are
+0.98/0.70/0.97%. Trajectory throughput is 1.974/2.026/1.973 per second.
+The candidate generates slightly more tokens than the first baseline on
+average, so fewer generated tokens do not explain this comparison. Output
+text can still vary with batching; these results establish correctness on
+these tasks, rather than general model-quality equivalence.
+
+Continuation TTFT p95 averages 131.0/62.3/132.1 ms across the three groups.
+Fresh TTFT p95 averages 492.7/320.2/322.4 ms, with the after baseline showing
+that its initial fresh improvement is not reproduced. The final trajectory's
+backend calls average 7.255/6.573/7.432 seconds; tool waits remain 24.52 seconds.
+Prefix-cache hit rate is approximately 89.92%, backend queues are nearly
+empty, and per-device mean GPU activity is approximately 84--85%. Thus most
+of this live task's final trajectory is tool waiting, which limits the wall
+benefit even when continuation TTFT improves substantially. This is a small
+reproduced backend configuration gain with burst disabled, not a burst or
+full-training speedup. Dense coverage and simultaneous TP4 live quality are
+not validated by this sparse-only live comparison.
 
 Next
 ----
